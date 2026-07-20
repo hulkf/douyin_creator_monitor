@@ -125,6 +125,23 @@ douyin_creator_monitor/local/pipeline.json
 - works_file：规范化作品 JSON 的输出位置。
 - profile_file：Obsidian 顶部基础信息所需的达人资料，可选。
 - correction_domain：如 douyin_shop_ads 或 ai_media。
+- summary_template_file：可选；为该达人显式指定内容总结模板，优先级高于飞书 `达人类型` 自动映射。
+
+Obsidian 的 `template_file` 仍是所有达人的通用笔记框架。可用 `summary_template_file` 指定默认内容总结模板，并通过 `summary_templates_by_creator_type` 按飞书达人基础信息表的 `达人类型` 选择专用模板。模板优先级为：达人配置 `summary_template_file` → 飞书 `达人类型` 映射 → Obsidian 全局 `summary_template_file` → 不插入总结模板。选中的模板会显示在 `## 原始文案` 上方；原始文案保持完整。
+
+~~~json
+{
+  "obsidian": {
+    "creator_type_field": "达人类型",
+    "summary_template_file": "",
+    "summary_templates_by_creator_type": {
+      "巨量千川": "D:/software/Obsidian/ljr_data/ljr_data/Template/巨量千川 知识框架与内容归档提示词模板.md"
+    }
+  }
+}
+~~~
+
+已经成功导出过的历史笔记仍受断点状态保护。要把新模板补写到旧笔记，需显式使用 `--force-stage obsidian_exported --overwrite`，避免日常增量任务无意覆盖人工编辑过的笔记。
 
 全局并发数可在 `asr.max_workers` 中配置。火山账号配额较低或本机需要同时执行 FFmpeg 转码时，可以先设为 2；网络和配额稳定后再逐步提高。命令行 `--asr-workers` 会临时覆盖配置文件。
 

@@ -48,6 +48,7 @@ tags:
   - 达人/{{达人目录_文本}}
 ---
 # {{作品标题_文本}}
+{{内容总结模板}}
 ## 原始文案
 {{原始文案}}
 <!-- CLEANING_RULES_START
@@ -277,6 +278,40 @@ def read_note_template(template_path: Path | None) -> str:
     return DEFAULT_NOTE_TEMPLATE
 
 
+def read_summary_template(template_path: Path | None) -> str:
+    if template_path is None:
+        return ""
+    try:
+        return template_path.read_text(encoding="utf-8-sig").strip("\ufeff\r\n")
+    except FileNotFoundError as exc:
+        raise ObsidianExportError(f"内容总结模板不存在: {template_path}") from exc
+    except OSError as exc:
+        raise ObsidianExportError(f"读取内容总结模板失败: {template_path}") from exc
+
+
+def add_summary_template_placeholder(template: str) -> str:
+    """Keep older note templates compatible while placing summaries above the transcript."""
+    placeholder = "{{内容总结模板}}"
+    template_without_placeholder = template.replace(placeholder, "")
+    original_heading = re.search(r"(?m)^## 原始文案\s*$", template_without_placeholder)
+    if original_heading:
+        return (
+            template_without_placeholder[: original_heading.start()]
+            + placeholder
+            + "\n"
+            + template_without_placeholder[original_heading.start():]
+        )
+    transcript_placeholder = template_without_placeholder.find("{{原始文案}}")
+    if transcript_placeholder >= 0:
+        return (
+            template_without_placeholder[:transcript_placeholder]
+            + placeholder
+            + "\n"
+            + template_without_placeholder[transcript_placeholder:]
+        )
+    raise ObsidianExportError("笔记模板缺少 {{内容总结模板}}、## 原始文案或 {{原始文案}} 插入位置。")
+
+
 def extract_cleaning_rules(template: str) -> str:
     match = re.search(r"<!--\s*CLEANING_RULES_START\s*(.*?)\s*CLEANING_RULES_END\s*-->", template, flags=re.S)
     if not match:
@@ -310,6 +345,7 @@ def build_note(
     creator_dir_name: str,
     transcript_path: Path,
     template_path: Path | None,
+    summary_template_path: Path | None = None,
 ) -> str:
     desc = str(work.get("desc") or work.get("raw", {}).get("desc") or "").strip()
     title = work_title(work, aweme_id)
@@ -320,6 +356,12 @@ def build_note(
     account_id = str(profile.get("账号ID") or "")
     platform = str(profile.get("所属平台") or "抖音")
     template = read_note_template(template_path)
+    summary_template = read_summary_template(summary_template_path)
+    if summary_template:
+        template = add_summary_template_placeholder(template)
+    summary_template_block = (
+        f"## 内容总结模板\n\n{summary_template}\n" if summary_template else ""
+    )
     cleaning_rules = extract_cleaning_rules(template)
     formatted_transcript = format_transcript_for_reading(transcript, cleaning_rules)
 
@@ -347,6 +389,7 @@ def build_note(
             "入库时间": yaml_string(exported_at),
             "入库时间_文本": exported_at,
             "原始文案": formatted_transcript,
+            "内容总结模板": summary_template_block.rstrip(),
             "正文清洗规则": cleaning_rules,
         },
     )
@@ -394,6 +437,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--creator-dir-name", default="", help="Obsidian 下的达人目录名；不填时使用 creator-name")
     parser.add_argument("--obsidian-original-dir", type=Path, default=DEFAULT_OBSIDIAN_ORIGINAL_DIR, help="Obsidian 原始文案根目录")
     parser.add_argument("--template-file", type=Path, default=DEFAULT_OBSIDIAN_TEMPLATE_FILE, help="Obsidian 原始文案模板文件；模板内 CLEANING_RULES 区块会作为正文清洗规则来源")
+    parser.add_argument("--summary-template-file", type=Path, help="显示在原始文案上方的内容总结/归档提示词模板")
     parser.add_argument("--overwrite", action="store_true", help="目标文件已存在时覆盖")
     parser.add_argument("--ensure-creator-dir-only", action="store_true", help="只确保达人目录存在并输出映射")
     parser.add_argument("--metadata-output", type=Path, help="目录映射 JSON 输出文件")
@@ -434,6 +478,7 @@ def main(argv: list[str] | None = None) -> int:
             creator_dir_name=creator_dir_name,
             transcript_path=args.transcript.resolve(),
             template_path=args.template_file,
+            summary_template_path=args.summary_template_file,
         )
         output_path.write_text(note, encoding="utf-8")
         print(output_path)

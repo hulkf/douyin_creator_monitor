@@ -56,7 +56,12 @@
   "obsidian": {
     "enabled": true,
     "original_dir": "D:/software/Obsidian/ljr_data/ljr_data/Z_Original",
-    "template_file": "D:/software/Obsidian/ljr_data/ljr_data/Template/视频原始文案模板.md"
+    "template_file": "D:/software/Obsidian/ljr_data/ljr_data/Template/视频原始文案模板.md",
+    "summary_template_file": "",
+    "creator_type_field": "达人类型",
+    "summary_templates_by_creator_type": {
+      "巨量千川": "D:/software/Obsidian/ljr_data/ljr_data/Template/巨量千川 知识框架与内容归档提示词模板.md"
+    }
   },
   "creators": [
     {
@@ -69,7 +74,8 @@
       "works_file": "runtime/zhiliao-works-from-mediacrawler.json",
       "profile_file": "runtime/profile-zhiliao-update.json",
       "media_output_dir": "runtime/mediacrawler-output-zhiliao",
-      "correction_domain": "douyin_shop_ads"
+      "correction_domain": "douyin_shop_ads",
+      "summary_template_file": ""
     },
     {
       "key": "nuomi",

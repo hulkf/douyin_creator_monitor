@@ -802,6 +802,7 @@ def obsidian_command(
     append_option(command, "--creator-dir-name", creator.get("creator_dir_name"))
     append_option(command, "--obsidian-original-dir", path_from(obsidian.get("original_dir")))
     append_option(command, "--template-file", path_from(obsidian.get("template_file")))
+    append_option(command, "--summary-template-file", select_summary_template_file(config, creator))
     if overwrite:
         command.append("--overwrite")
     return command
@@ -835,8 +836,55 @@ def creator_match(creator: dict[str, Any]) -> tuple[str, str]:
     raise PipelineError("无法确定飞书达人基础表的匹配字段和值。")
 
 
-def mapping_sync_command(
-    config: dict[str, Any], creator: dict[str, Any], metadata: Path | list[Path],
+def field_text(value: Any) -> str:
+    """Normalize Feishu text/select cell shapes to one comparable string."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    if isinstance(value, list):
+        return next((text for item in value if (text := field_text(item))), "")
+    if isinstance(value, dict):
+        for key in ("text", "name", "value"):
+            if key in value and (text := field_text(value[key])):
+                return text
+    return ""
+
+
+def select_summary_template_file(config: dict[str, Any], creator: dict[str, Any]) -> Path | None:
+    """Resolve per-creator override, creator-type mapping, then the global default."""
+    explicit = path_from(creator.get("summary_template_file"))
+    if explicit is not None:
+        return explicit
+
+    obsidian = section(config, "obsidian")
+    creator_type = field_text(creator.get("creator_type"))
+    mappings = obsidian.get("summary_templates_by_creator_type")
+    if creator_type and isinstance(mappings, dict):
+        for configured_type, template_file in mappings.items():
+            if field_text(configured_type).casefold() == creator_type.casefold():
+                selected = path_from(template_file)
+                if selected is not None:
+                    return selected
+    return path_from(obsidian.get("summary_template_file"))
+
+
+def creator_fields_command(
+    config: dict[str, Any], creator: dict[str, Any], field_names: list[str],
+) -> list[str]:
+    extra_args: list[str] = []
+    for field_name in field_names:
+        extra_args.extend(["--field", field_name])
+    return creator_record_command(
+        config, creator, "read_creator_fields_from_feishu.py", extra_args,
+    )
+
+
+def creator_record_command(
+    config: dict[str, Any], creator: dict[str, Any], script: str,
+    extra_args: list[str] | None = None,
 ) -> list[str]:
     feishu = section(config, "feishu")
     table_id = str(feishu.get("creator_table_id") or "").strip()
@@ -844,15 +892,85 @@ def mapping_sync_command(
         raise PipelineError("feishu.creator_table_id 未配置达人基础信息表 ID。")
     match_field, match_value = creator_match(creator)
     command = py(
-        config, "sync_creator_backup_mapping_to_feishu.py",
-        "--table-id", table_id, "--match-field", match_field, "--match-value", match_value,
+        config,
+        script,
+        "--table-id", table_id,
+        "--match-field", match_field,
+        "--match-value", match_value,
     )
-    metadata_files = metadata if isinstance(metadata, list) else [metadata]
-    for metadata_file in metadata_files:
-        command.extend(["--metadata-file", str(metadata_file)])
+    command.extend(extra_args or [])
     append_option(command, "--lark-cli", feishu.get("lark_cli"))
     append_option(command, "--as", feishu.get("as_identity"))
     return command
+
+
+def hydrate_creator_type_from_feishu(
+    config: dict[str, Any], creator: dict[str, Any], runner: Runner,
+    logger: Logger, env: dict[str, str], args: argparse.Namespace,
+) -> dict[str, Any]:
+    """Fetch the Base creator type once; failures safely fall back to local/default templates."""
+    obsidian = section(config, "obsidian")
+    mappings = obsidian.get("summary_templates_by_creator_type")
+    if (
+        not isinstance(mappings, dict)
+        or not mappings
+        or getattr(args, "skip_obsidian", False)
+        or not bool(obsidian.get("enabled", True))
+        or creator.get("summary_template_file") not in (None, "")
+    ):
+        return {}
+    field_name = str(obsidian.get("creator_type_field") or "达人类型").strip()
+    if not field_name:
+        return {}
+    try:
+        output = runner.run(
+            f"读取飞书达人类型 {creator_key(creator)}",
+            creator_fields_command(config, creator, [field_name]),
+            env,
+            sensitive=("--table-id", "--base-token", "--match-value"),
+        )
+        if runner.dry_run:
+            return {"creator_type_source": "planned"}
+        payload = json.loads(output)
+        fields = payload.get("fields") if isinstance(payload, dict) else None
+        if not isinstance(fields, dict):
+            raise ValueError("返回内容缺少 fields")
+        remote_type = field_text(fields.get(field_name))
+        if not remote_type:
+            creator.pop("creator_type", None)
+            logger.write(f"飞书达人字段 {field_name} 为空，继续使用通用总结模板")
+            return {
+                "creator_type": "",
+                "creator_type_source": "feishu_empty",
+                "summary_template_file": str(select_summary_template_file(config, creator) or ""),
+            }
+        creator["creator_type"] = remote_type
+        return {
+            "creator_type": remote_type,
+            "creator_type_source": "feishu",
+            "summary_template_file": str(select_summary_template_file(config, creator) or ""),
+        }
+    except Exception as exc:
+        creator.pop("creator_type", None)
+        logger.write(f"读取飞书达人类型失败，继续使用通用总结模板: {exc}")
+        return {
+            "creator_type": "",
+            "creator_type_source": "default_fallback",
+            "creator_type_error": str(exc),
+            "summary_template_file": str(select_summary_template_file(config, creator) or ""),
+        }
+
+
+def mapping_sync_command(
+    config: dict[str, Any], creator: dict[str, Any], metadata: Path | list[Path],
+) -> list[str]:
+    metadata_files = metadata if isinstance(metadata, list) else [metadata]
+    extra_args: list[str] = []
+    for metadata_file in metadata_files:
+        extra_args.extend(["--metadata-file", str(metadata_file)])
+    return creator_record_command(
+        config, creator, "sync_creator_backup_mapping_to_feishu.py", extra_args,
+    )
 
 
 def ensure_and_sync_mapping(
@@ -1786,15 +1904,18 @@ def process_creator_phase(
             "error": detail,
         }
 
-    def sync_mappings_timed() -> tuple[dict[str, str] | None, float, Exception | None]:
+    def sync_mappings_timed() -> tuple[dict[str, str] | None, dict[str, Any], float, Exception | None]:
         started = time.perf_counter()
+        creator_type_info = hydrate_creator_type_from_feishu(
+            config, creator, runner, logger, env, args,
+        )
         try:
             mappings = sync_creator_backup_mappings(
                 config, creator, profile_file, state_dir, runner, logger, env, args,
             )
-            return mappings, time.perf_counter() - started, None
+            return mappings, creator_type_info, time.perf_counter() - started, None
         except Exception as exc:
-            return None, time.perf_counter() - started, exc
+            return None, creator_type_info, time.perf_counter() - started, exc
 
     with ThreadPoolExecutor(max_workers=1, thread_name_prefix="creator-mapping") as mapping_executor:
         mapping_future = mapping_executor.submit(sync_mappings_timed)
@@ -1804,8 +1925,9 @@ def process_creator_phase(
             nonlocal mappings_ready
             if mappings_ready:
                 return
-            mappings, mapping_seconds, mapping_error = mapping_future.result()
+            mappings, creator_type_info, mapping_seconds, mapping_error = mapping_future.result()
             result.setdefault("phase_timings", {})["backup_mapping_seconds"] = round(mapping_seconds, 3)
+            result.update(creator_type_info)
             mappings_ready = True
             if mapping_error is None:
                 result["backup_mappings"] = mappings or {}
