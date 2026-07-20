@@ -1,0 +1,40 @@
+# Local secrets and environment files
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Runtime state, auth cache, logs, and generated artifacts
+local/
+runtime/
+logs/
+output/
+secrets/
+tmp/
+cache/
+*.local.md
+*.local.json
+
+# CodeGraph local index
+.codegraph/*
+!.codegraph/.gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Node and local tools
+node_modules/
+tools/
+
+# OS and editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

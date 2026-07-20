@@ -1,0 +1,87 @@
+{
+  "python": "",
+  "max_works": 0,
+  "state_dir": "runtime/pipeline",
+  "media_dir": "runtime/media",
+  "log_dir": "logs",
+  "collection": {
+    "incremental_enabled": true,
+    "incremental_probe_count": 3,
+    "cdp_port_start": 9222,
+    "cdp_port_stride": 10,
+    "media_crawler_dir": "D:/path/to/MediaCrawler",
+    "media_crawler_python": "D:/path/to/MediaCrawler/.venv/Scripts/python.exe",
+    "max_count": 200,
+    "expect_min_count": 1,
+    "login_type": "qrcode",
+    "save_data_option": "jsonl",
+    "clean_media_output": false
+  },
+  "feishu": {
+    "base_token_env": "FEISHU_BASE_TOKEN",
+    "creator_table_id": "REPLACE_WITH_FEISHU_CREATOR_TABLE_ID",
+    "ids_file": "local/feishu-ids.md",
+    "lark_cli": "tools/lark-cli/lark-cli.exe",
+    "work_id_field": "抖音作品ID",
+    "transcript_field": "语音转写全文",
+    "as_identity": "user"
+  },
+  "asr": {
+    "provider": "volcengine",
+    "mode": "direct-url",
+    "max_workers": 4,
+    "ffmpeg": "",
+    "model": "",
+    "endpoint": ""
+  },
+  "correction": {
+    "domain": "douyin_shop_ads",
+    "glossary": "config/domain_glossary.json"
+  },
+  "backups": {
+    "max_workers": 3,
+    "mapping_cache_ttl_hours": 24
+  },
+  "ima": {
+    "enabled": true,
+    "mapping": "local/ima_creator_mapping.json",
+    "on_duplicate": "skip"
+  },
+  "kuake": {
+    "enabled": true,
+    "local_env": "local/kuake.env.json",
+    "kuake_exe": "tools/kuake-cli/kuake.exe",
+    "base_dir": ""
+  },
+  "obsidian": {
+    "enabled": true,
+    "original_dir": "D:/software/Obsidian/ljr_data/ljr_data/Z_Original",
+    "template_file": "D:/software/Obsidian/ljr_data/ljr_data/Template/视频原始文案模板.md"
+  },
+  "creators": [
+    {
+      "key": "zhiliao",
+      "enabled": true,
+      "creator_url": "https://www.douyin.com/user/REPLACE_WITH_SEC_USER_ID",
+      "creator_name": "知了-千川推商品",
+      "creator_dir_name": "知了",
+      "works_table_id": "REPLACE_WITH_FEISHU_TABLE_ID",
+      "works_file": "runtime/zhiliao-works-from-mediacrawler.json",
+      "profile_file": "runtime/profile-zhiliao-update.json",
+      "media_output_dir": "runtime/mediacrawler-output-zhiliao",
+      "correction_domain": "douyin_shop_ads"
+    },
+    {
+      "key": "nuomi",
+      "enabled": false,
+      "creator_url": "https://www.douyin.com/user/REPLACE_WITH_SEC_USER_ID",
+      "creator_name": "糯米爸(付费流分享)",
+      "creator_dir_name": "糯米爸",
+      "works_table_id": "REPLACE_WITH_FEISHU_TABLE_ID",
+      "works_file": "runtime/nuomi-works-from-mediacrawler.json",
+      "profile_file": "runtime/nuomi-profile-update.json",
+      "media_output_dir": "runtime/mediacrawler-output-nuomi",
+      "correction_domain": "douyin_shop_ads"
+    }
+  ]
+}

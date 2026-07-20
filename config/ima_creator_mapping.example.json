@@ -1,0 +1,18 @@
+{
+  "default": {
+    "knowledge_base_name": "抖音达人文案库",
+    "knowledge_base_id": "YOUR_IMA_KNOWLEDGE_BASE_ID",
+    "folder_name": "",
+    "folder_id": ""
+  },
+  "creators": [
+    {
+      "creator_name": "示例博主",
+      "aliases": ["示例账号昵称"],
+      "knowledge_base_name": "抖音达人文案库",
+      "knowledge_base_id": "YOUR_IMA_KNOWLEDGE_BASE_ID",
+      "folder_name": "示例博主",
+      "folder_id": "folder_xxxxxxxxxxxxxxxx"
+    }
+  ]
+}
