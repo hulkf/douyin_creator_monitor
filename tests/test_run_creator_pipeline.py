@@ -118,6 +118,45 @@ class PipelineHelpersTest(unittest.TestCase):
             self.assertEqual(sum(item["stages"]["feishu_written_back"]["duration_seconds"] for item in states), 6.0)
             self.assertEqual(states[0]["stages"]["kuake_backed_up"]["batch_duration_seconds"], 4.0)
 
+    def test_batch_finalizer_preserves_summary_missing_local_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            creator = {"key": "a", "creator_name": "达人 A", "works_table_id": "tbl1"}
+            selected = [{"aweme_id": "1", "create_time": 1}]
+            final_file = root / "1.txt"
+            final_file.write_text("文案", encoding="utf-8")
+            delivery_results = {
+                "1": {
+                    "aweme_id": "1",
+                    "stages": {
+                        "summarized": PIPELINE.SUMMARY_TEMPLATE_MISSING,
+                        "ima_backed_up": "success", "kuake_backed_up": "success",
+                        "obsidian_exported": "success", "feishu_written_back": "pending",
+                        "backup_statuses_written_back": "pending",
+                    },
+                    "_batch": {
+                        "state_path": str(root / "state" / "a" / "1.json"),
+                        "transcript_file": str(final_file), "record_id": "rec1",
+                    },
+                }
+            }
+
+            def inspect_manifest(label, command, env, **unused):
+                manifest = Path(command[command.index("--manifest") + 1])
+                payload = json.loads(manifest.read_text(encoding="utf-8"))
+                self.assertEqual(payload["records"][0]["local_status"], "内容总结待补充")
+                return json.dumps({"results": {"1": {"status": "success"}}})
+
+            runner = Mock()
+            runner.run.side_effect = inspect_manifest
+            PIPELINE.finalize_creator_batches(
+                {}, creator, selected, delivery_results, root / "state", runner,
+                PIPELINE.Logger(root / "log.txt", persist=False), {},
+                argparse.Namespace(dry_run=False, fail_fast=False),
+            )
+
+            self.assertEqual(delivery_results["1"]["stages"]["backup_statuses_written_back"], "success")
+
     def test_quark_batch_recovers_completed_checkpoint_after_child_termination(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

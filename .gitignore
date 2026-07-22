@@ -32,6 +32,10 @@ venv/
 # Node and local tools
 node_modules/
 tools/
+.workbuddy/
+
+# Accidental command/output fragments
+/Check
 
 # OS and editors
 .DS_Store

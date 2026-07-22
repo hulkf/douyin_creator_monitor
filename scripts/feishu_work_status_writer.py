@@ -121,7 +121,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--as", dest="as_identity", default="user", choices=["user", "bot"])
     parser.add_argument("--ima-status", choices=["待上传", "已上传", "失败", "跳过"])
     parser.add_argument("--kuake-status", choices=["待上传", "已上传", "失败", "跳过"])
-    parser.add_argument("--local-status", choices=["待写入", "已写入", "失败", "跳过"])
+    parser.add_argument("--local-status", choices=["待写入", "已写入", "失败", "跳过", "内容总结待补充"])
     parser.add_argument("--record-time")
     parser.add_argument("--transcript-file")
     parser.add_argument("--transcript-field", default="语音转写全文")
@@ -188,7 +188,7 @@ def main(argv: list[str] | None = None) -> int:
                     breaker = error
             write_checkpoint(result_file, results, batch_id)
         print(json.dumps({"results": results}, ensure_ascii=False))
-        return 0
+        return 1 if any(item.get("status") == "failed" for item in results.values()) else 0
 
     if not args.table_id or not args.work_id:
         parser.error("单条写回需要 --table-id 和 --work-id")

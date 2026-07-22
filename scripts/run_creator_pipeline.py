@@ -35,6 +35,7 @@ HASHTAG_RE = re.compile(r"#([^#\s]+)")
 INVALID_PATH_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 STAGES = (
     "collected", "feishu_synced", "transcribed", "corrected",
+    "summarized",
     "feishu_written_back", "ima_backed_up", "kuake_backed_up",
     "obsidian_exported", "backup_statuses_written_back",
 )
@@ -280,6 +281,7 @@ def artifact_paths(media_dir: Path, work_id: str, provider: str) -> dict[str, Pa
         "raw_json": media_dir / f"{work_id}.{provider_name}.json",
         "raw_text": media_dir / f"{work_id}.{provider_name}.txt",
         "final": media_dir / f"{work_id}.final.txt",
+        "summary": media_dir / f"{work_id}.summary.md",
         "report": media_dir / f"{work_id}.correction-report.json",
     }
 
@@ -561,6 +563,7 @@ def collect_command(
     )
     append_option(command, "--media-crawler-dir", chosen(creator, defaults, "media_crawler_dir"))
     append_option(command, "--media-crawler-python", chosen(creator, defaults, "media_crawler_python"))
+    append_option(command, "--min-publish-date", chosen(creator, defaults, "min_publish_date", "2025-01-01"))
     if chosen(creator, defaults, "clean_media_output", False):
         command.append("--clean-media-output")
     incremental_enabled = bool(chosen(creator, defaults, "incremental_enabled", True))
@@ -617,6 +620,33 @@ def correction_command(config: dict[str, Any], creator: dict[str, Any], paths: d
     return command
 
 
+def summary_command(
+    config: dict[str, Any], creator: dict[str, Any], work: dict[str, Any],
+    paths: dict[str, Path], template_file: Path,
+) -> list[str]:
+    defaults = section(config, "summary")
+    command = py(
+        config, "generate_transcript_summary.py",
+        "--transcript", paths["final"],
+        "--template-file", template_file,
+        "--output", paths["summary"],
+    )
+    append_option(command, "--creator-name", creator.get("creator_name"))
+    append_option(command, "--title", title_of(work))
+    append_option(command, "--aweme-id", work.get("aweme_id"))
+    for option, key in (
+        ("--model", "model"),
+        ("--base-url", "base_url"),
+        ("--api-key-env", "api_key_env"),
+        ("--temperature", "temperature"),
+        ("--max-tokens", "max_tokens"),
+        ("--timeout", "timeout"),
+        ("--retry-attempts", "retry_attempts"),
+    ):
+        append_option(command, option, chosen(creator, defaults, key))
+    return command
+
+
 def writeback_command(
     config: dict[str, Any], creator: dict[str, Any], work: dict[str, Any], paths: dict[str, Path],
     record_id: str | None = None,
@@ -637,10 +667,39 @@ def writeback_command(
     return command
 
 
+# 特定的、与其他写入错误完全隔离的标记：
+# Obsidian 笔记缺失「内容总结」模块（## 内容总结 段落）。
+# 这不是泛化的写入失败，它有专属、明确的解决方案（supplement_content_summary.py），
+# 必须始终与 "failed"（真正的写入/投递错误）区分开，绝不能混为一谈。
+SUMMARY_TEMPLATE_MISSING = "summary_template_missing"
+
+# 飞书「本地知识库状态」中代表"内容总结待补充"的独立值，与"失败"严格隔离。
+LOCAL_STATUS_SUMMARY_MISSING = "内容总结待补充"
+
+
 def final_backup_status(outcome: str, success_value: str) -> str:
     if outcome in {"success", "skipped", "planned"}:
         return success_value
     if outcome == "disabled":
+        return "跳过"
+    return "失败"
+
+
+def local_knowledge_status(stages: dict[str, Any]) -> str:
+    """Obsidian「本地知识库状态」取值，把"内容总结缺失"从泛化写入错误里隔离出来。
+
+    - 笔记已写入 + 总结已存在        -> 已写入
+    - 笔记已写入 + 总结缺失(专属标记) -> 内容总结待补充   （隔离，不是"失败"）
+    - 笔记写入被禁用                -> 跳过
+    - 笔记写入失败/受阻             -> 失败
+    """
+    obs = stages.get("obsidian_exported")
+    summ = stages.get("summarized")
+    if obs in {"success", "skipped", "planned"}:
+        if summ == SUMMARY_TEMPLATE_MISSING:
+            return LOCAL_STATUS_SUMMARY_MISSING
+        return "已写入"
+    if obs == "disabled":
         return "跳过"
     return "失败"
 
@@ -669,7 +728,7 @@ def status_writeback_command(
         "--work-id", work["aweme_id"],
         "--ima-status", final_backup_status(str(stages.get("ima_backed_up", "blocked")), "已上传"),
         "--kuake-status", final_backup_status(str(stages.get("kuake_backed_up", "blocked")), "已上传"),
-        "--local-status", final_backup_status(str(stages.get("obsidian_exported", "blocked")), "已写入"),
+        "--local-status", local_knowledge_status(stages),
     )
     append_option(command, "--work-id-field", feishu.get("work_id_field"))
     append_option(command, "--lark-cli", feishu.get("lark_cli"))
@@ -802,6 +861,8 @@ def obsidian_command(
     append_option(command, "--creator-dir-name", creator.get("creator_dir_name"))
     append_option(command, "--obsidian-original-dir", path_from(obsidian.get("original_dir")))
     append_option(command, "--template-file", path_from(obsidian.get("template_file")))
+    summary_path = paths.get("summary")
+    append_option(command, "--summary-file", summary_path if summary_path and nonempty(summary_path) else None)
     append_option(command, "--summary-template-file", select_summary_template_file(config, creator))
     if overwrite:
         command.append("--overwrite")
@@ -869,6 +930,41 @@ def select_summary_template_file(config: dict[str, Any], creator: dict[str, Any]
                 if selected is not None:
                     return selected
     return path_from(obsidian.get("summary_template_file"))
+
+
+def summary_capability(config: dict[str, Any], args: argparse.Namespace) -> str:
+    """Decide how the content summary can be produced for this run.
+
+    Returns one of:
+      - "llm":   a summarization LLM is configured (model + key) -> pipeline generates it.
+      - "agent": the run was invoked by the Agent, which will fill the summary in-session.
+      - "none":  no summarization capability available -> defer (write original, fill later).
+    """
+    cached = getattr(args, "_summary_capability", None)
+    if cached in {"llm", "agent", "none"}:
+        return str(cached)
+    summary_cfg = section(config, "summary")
+    model = (summary_cfg.get("model") or os.environ.get("SUMMARY_LLM_MODEL", "")).strip()
+    api_key_env = str(
+        summary_cfg.get("api_key_env")
+        or os.environ.get("SUMMARY_LLM_API_KEY_ENV", "OPENAI_API_KEY")
+    ).strip()
+    if model and api_key_env and os.environ.get(api_key_env, "").strip():
+        capability = "llm"
+        setattr(args, "_summary_capability", capability)
+        return capability
+    invoked_by = os.environ.get("DC_INVOKED_BY", "").strip().lower()
+    agent_flag = PROJECT_DIR / "local" / ".agent_invoked"
+    if invoked_by == "agent" or agent_flag.exists():
+        try:
+            agent_flag.unlink()
+        except OSError:
+            pass
+        capability = "agent"
+    else:
+        capability = "none"
+    setattr(args, "_summary_capability", capability)
+    return capability
 
 
 def creator_fields_command(
@@ -1245,6 +1341,9 @@ def prepare_work(
         if status_of(state, "corrected") != "success" and nonempty(paths["final"]):
             set_status(state, "corrected", "success", "检测到已有纠正后文案", True)
             changed = True
+        if status_of(state, "summarized") != "success" and nonempty(paths["summary"]):
+            set_status(state, "summarized", "success", "检测到已有内容总结", True)
+            changed = True
         if changed:
             write_json(state_path, state)
 
@@ -1347,6 +1446,52 @@ def process_downstream(
     final_available = (args.dry_run or nonempty(paths["final"])) and correction_outcome not in {"failed", "blocked"}
     if correction_outcome == "disabled":
         final_available = nonempty(paths["final"])
+    summary_template_file = select_summary_template_file(config, creator)
+    summary_required = (
+        summary_template_file is not None
+        and not getattr(args, "skip_obsidian", False)
+        and not getattr(args, "feishu_only", False)
+        and bool(section(config, "obsidian").get("enabled", True))
+        and bool(section(config, "summary").get("enabled", True))
+    )
+    capability = summary_capability(config, args)
+    if not summary_required:
+        result["stages"]["summarized"] = "disabled"
+    elif not final_available:
+        result["stages"]["summarized"] = "blocked"
+    elif capability == "llm":
+        result["stages"]["summarized"] = execute_stage(
+            "summarized", f"内容总结 {work_id}", state, state_path, args, logger,
+            lambda: runner.run(
+                f"内容总结 {work_id}",
+                summary_command(config, creator, work, paths, summary_template_file),
+                env,
+            ),
+            (paths["summary"],),
+        )
+    else:
+        # No LLM connected (manual) or Agent will fill in-session: defer the summary.
+        if nonempty(paths["summary"]):
+            # Summary file already provided (e.g. by the Agent) -> accept it.
+            if not args.dry_run:
+                set_status(state, "summarized", "success", "检测到已有内容总结", True)
+                write_json(state_path, state)
+            result["stages"]["summarized"] = "planned" if args.dry_run else "success"
+        else:
+            # 内容总结模板缺失：这是一个明确、特定、可隔离的标记，而非泛化写入错误。
+            # 笔记原文照常写入 Obsidian，但须由 supplement_content_summary.py 在具备
+            # 模型能力时补充「内容总结」模块。原因字符串直接说明"模板缺失/待补充"。
+            template_name = Path(summary_template_file).name if summary_template_file else "（未配置模板）"
+            reason = f"内容总结模板缺失，待补充（模板：{template_name}）"
+            logger.write(f"内容总结模板缺失 {work_id}: {reason}；原文已写入 Obsidian，待补充总结后合并。")
+            if not args.dry_run:
+                set_status(state, "summarized", SUMMARY_TEMPLATE_MISSING, reason)
+                write_json(state_path, state)
+            result["stages"]["summarized"] = "planned" if args.dry_run else SUMMARY_TEMPLATE_MISSING
+    summary_ready = (
+        not summary_required
+        or result["stages"].get("summarized") in {"success", "skipped", "planned", SUMMARY_TEMPLATE_MISSING}
+    )
     transcript_file: Path | None = None
     if args.skip_feishu_writeback:
         result["stages"]["feishu_written_back"] = "disabled"
@@ -1360,6 +1505,15 @@ def process_downstream(
     else:
         result["stages"]["feishu_written_back"] = "pending"
         transcript_file = paths["final"]
+
+    # Force Obsidian overwrite when the content-summary module is missing, so a
+    # placeholder note (original transcript only) gets replaced by the filled
+    # summary on a later run / by supplement_content_summary.py.
+    force_obsidian_overwrite = (
+        result["stages"].get("summarized") == SUMMARY_TEMPLATE_MISSING
+        or status_of(state, "obsidian_exported") == SUMMARY_TEMPLATE_MISSING
+    )
+    obsidian_overwrite = bool(args.overwrite) or force_obsidian_overwrite
 
     backups: list[tuple[str, bool, str, Callable[[], None]]] = [
         (
@@ -1380,12 +1534,14 @@ def process_downstream(
             f"备份 Obsidian {work_id}",
             lambda: runner.run(
                 f"备份 Obsidian {work_id}",
-                obsidian_command(config, creator, work, works_file, profile_file, paths, args.overwrite), env,
+                obsidian_command(config, creator, work, works_file, profile_file, paths, obsidian_overwrite), env,
             ),
         ),
     ]
     runnable: list[tuple[str, Callable[[], None]]] = []
     breakers = getattr(args, "_delivery_breakers", {})
+    if not isinstance(breakers, dict):
+        breakers = {}
     for stage, disabled, label, action in backups:
         if disabled:
             if getattr(args, "feishu_only", False):
@@ -1398,6 +1554,8 @@ def process_downstream(
             else:
                 result["stages"][stage] = "disabled"
         elif not final_available:
+            result["stages"][stage] = "blocked"
+        elif stage == "obsidian_exported" and not summary_ready:
             result["stages"][stage] = "blocked"
         elif should_skip(state, stage, args.resume, args.force_stage):
             logger.write(f"跳过 {label}：状态已完成")
@@ -1434,6 +1592,15 @@ def process_downstream(
             state_changed = True
     if state_changed:
         write_json(state_path, state)
+    # When the content-summary module is missing (SUMMARY_TEMPLATE_MISSING), the
+    # note currently holds only the original transcript. obsidian_exported stays
+    # "success" (the note WAS written) — we must NOT relabel it as a write error/
+    # deferred, or it would pollute the "本地知识库状态" mapping ("失败"). Re-merging
+    # with the filled summary is owned by supplement_content_summary.py (or by a
+    # fresh run once a model is configured); force_obsidian_overwrite above already
+    # ensures the note is overwritten when that happens.
+    if result["stages"].get("summarized") == SUMMARY_TEMPLATE_MISSING and result["stages"].get("obsidian_exported") == "success":
+        logger.write(f"内容总结模板缺失 {work_id}：Obsidian 笔记已写入原文，待补充总结模块后合并。")
     if args.fail_fast and any(item.get("status") == "failed" for item in outcomes.values()):
         raise PipelineError(f"作品 {work_id} 存在备份失败阶段。")
     if getattr(args, "_defer_feishu_writeback", False):
@@ -1800,7 +1967,7 @@ def finalize_creator_batches(
                     "transcript_file": delivery_results[work_id]["_batch"].get("transcript_file") or "",
                     "ima_status": final_backup_status(str(delivery_results[work_id]["stages"].get("ima_backed_up", "blocked")), "已上传"),
                     "kuake_status": final_backup_status(str(delivery_results[work_id]["stages"].get("kuake_backed_up", "blocked")), "已上传"),
-                    "local_status": final_backup_status(str(delivery_results[work_id]["stages"].get("obsidian_exported", "blocked")), "已写入"),
+                    "local_status": local_knowledge_status(delivery_results[work_id]["stages"]),
                 }
                 for work_id in feishu_ids
             ],
@@ -2114,6 +2281,51 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def run_missing_summary_supplement(
+    config: dict[str, Any], creators: list[dict[str, Any]],
+    runner: "Runner", logger: "Logger", env: dict[str, str], args: argparse.Namespace,
+) -> None:
+    """Auto-invoke the standalone supplement module for works flagged with the
+    isolated SUMMARY_TEMPLATE_MISSING marker, but ONLY when all three trigger
+    conditions hold:
+
+      (a) the work is detected as missing its content-summary module
+          (state summarized == SUMMARY_TEMPLATE_MISSING);
+      (b) the creator is configured with a summary template (should be supplemented);
+      (c) model capability is currently available (summary_capability == "llm").
+
+    Each condition is checked before any work is done; if the model is absent the
+    supplement script would refuse anyway, so we don't even invoke it.
+    """
+    if summary_capability(config, args) != "llm":
+        return  # 触发条件 (c) 不满足：当前不具备模型能力，不调用补充脚本
+    state_dir = path_from(config.get("state_dir"), DEFAULT_STATE_DIR) or DEFAULT_STATE_DIR
+    for creator in creators:
+        if not (bool(section(config, "obsidian").get("enabled", True))
+                and bool(section(config, "summary").get("enabled", True))):
+            continue
+        if select_summary_template_file(config, creator) is None:
+            continue  # 触发条件 (b) 不满足：未配置总结模板，跳过（这是另一类情况）
+        creator_state_dir = state_dir / creator_key(creator)
+        if not creator_state_dir.is_dir():
+            continue
+        flagged: list[str] = []
+        for sp in sorted(creator_state_dir.glob("*.json")):
+            try:
+                state = read_json(sp)
+            except (OSError, PipelineError):
+                continue
+            if status_of(state, "summarized") == SUMMARY_TEMPLATE_MISSING:
+                aweme_id = str(state.get("aweme_id") or "").strip()
+                if aweme_id:
+                    flagged.append(aweme_id)
+        if not flagged:
+            continue  # 触发条件 (a) 不满足：该达人无缺失内容总结的作品
+        logger.write(f"自动补充内容总结 {creator_key(creator)}: 发现 {len(flagged)} 篇缺失内容总结模块，调用补充模块。")
+        command = py(config, "supplement_content_summary.py", "--creator", creator_key(creator))
+        runner.run(f"补充内容总结 {creator_key(creator)}", command, env)
+
+
 def main(argv: list[str] | None = None) -> int:
     wall_started = time.perf_counter()
     started_at = now_text()
@@ -2271,10 +2483,26 @@ def main(argv: list[str] | None = None) -> int:
                     else:
                         summary["creators"].append(future.result())
 
+        # 内容总结模板缺失补全自动触发（仅当具备模型能力时）。
+        # 满足触发条件：① 该作品被标记为 SUMMARY_TEMPLATE_MISSING（缺失模块）；
+        # ② 该达人配置了总结模板（应补充）；③ summary_capability == "llm"（当前
+        # 具备模型能力）。三者齐备才调用独立模块 supplement_content_summary.py。
+        supplement_error = ""
+        if not args.dry_run and summary_capability(config, args) == "llm":
+            try:
+                run_missing_summary_supplement(config, creators, runner, logger, env, args)
+            except Exception as exc:
+                supplement_error = str(exc)
+                logger.write(f"自动补充内容总结失败: {exc}")
+
         summary["finished_at"] = now_text()
         summary["wall_seconds"] = round(time.perf_counter() - wall_started, 3)
         summary["timings"] = summarize_metrics(runner.metrics)
-        failed = any(item.get("status") in {"failed", "partial_failure"} for item in summary["creators"])
+        failed = bool(supplement_error) or any(
+            item.get("status") in {"failed", "partial_failure"} for item in summary["creators"]
+        )
+        if supplement_error:
+            summary["summary_supplement_error"] = supplement_error
         summary["status"] = "partial_failure" if failed else ("planned" if args.dry_run else "success")
         if not args.dry_run:
             state_dir = path_from(config.get("state_dir"), DEFAULT_STATE_DIR) or DEFAULT_STATE_DIR

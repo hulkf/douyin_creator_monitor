@@ -12,6 +12,15 @@ import sys
 from pathlib import Path
 from typing import Any
 
+# 字段归属/规则校验（单一权威来源：scripts/creator_table_fields.py）。
+# 模块缺失时降级为无操作，绝不阻断主流程。
+try:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from creator_table_fields import validate_backup_patch
+except Exception:  # noqa: BLE001
+    def validate_backup_patch(patch):
+        return patch, []
+
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 LOCAL_FEISHU_IDS = PROJECT_DIR / "local" / "feishu-ids.md"
@@ -239,6 +248,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         platforms, created, patch = load_patches(args.metadata_file)
         platform = ",".join(platforms)
+        patch, backup_warn = validate_backup_patch(patch)
+        for w in backup_warn:
+            print(f"[备份校验] 警告（{platform}）：{w}", file=sys.stderr)
         token = load_base_token(args.base_token)
         record_id = args.record_id or search_creator_record(
             args.lark_cli, token, args.table_id, args.match_field,

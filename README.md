@@ -96,6 +96,7 @@ douyin_creator_monitor/scripts/run_creator_pipeline.py
 8. 在飞书文案回写完成后，受控并行备份到 IMA、夸克网盘和 Obsidian；三个备份阶段失败互不影响。
 
 视频转音频、火山 ASR 和文案纠正按作品受控并发，默认并发数为 4。IMA、夸克和 Obsidian 默认最多 3 路独立备份并发；飞书同表写入保持串行或批量，避免共享记录竞争。每条作品使用独立临时目录、产物文件和状态文件。
+内容总结单独由 `summary` 配置段控制。只有模型名和对应 API Key 环境变量同时可用时，才调用 OpenAI-compatible 接口生成 `runtime/media/<作品ID>.summary.md`；429、5xx 和临时网络错误默认重试 3 次，结果通过临时文件原子落盘。没有可用模型能力时，作品明确标记为“内容总结待补充”，不会虚报为已完整写入。
 
 ### 配置文件
 
@@ -127,10 +128,17 @@ douyin_creator_monitor/local/pipeline.json
 - correction_domain：如 douyin_shop_ads 或 ai_media。
 - summary_template_file：可选；为该达人显式指定内容总结模板，优先级高于飞书 `达人类型` 自动映射。
 
-Obsidian 的 `template_file` 仍是所有达人的通用笔记框架。可用 `summary_template_file` 指定默认内容总结模板，并通过 `summary_templates_by_creator_type` 按飞书达人基础信息表的 `达人类型` 选择专用模板。模板优先级为：达人配置 `summary_template_file` → 飞书 `达人类型` 映射 → Obsidian 全局 `summary_template_file` → 不插入总结模板。选中的模板会显示在 `## 原始文案` 上方；原始文案保持完整。
+Obsidian 的 `template_file` 仍是所有达人的通用笔记框架。可用 `summary_template_file` 指定默认内容总结提示词，并通过 `summary_templates_by_creator_type` 按飞书达人基础信息表的 `达人类型` 选择专用提示词。模板优先级为：达人配置 `summary_template_file` → 飞书 `达人类型` 映射 → Obsidian 全局 `summary_template_file` → 不使用专用提示词。提示词模板本身不会直接写入笔记；只有已经生成好的 `runtime/media/<作品ID>.summary.md` 会显示在 `## 原始文案` 上方，原始文案保持完整。
 
 ~~~json
 {
+  "summary": {
+    "enabled": true,
+    "model": "",
+    "base_url": "https://api.openai.com/v1",
+    "api_key_env": "OPENAI_API_KEY",
+    "retry_attempts": 3
+  },
   "obsidian": {
     "creator_type_field": "达人类型",
     "summary_template_file": "",
@@ -146,6 +154,8 @@ Obsidian 的 `template_file` 仍是所有达人的通用笔记框架。可用 `s
 全局并发数可在 `asr.max_workers` 中配置。火山账号配额较低或本机需要同时执行 FFmpeg 转码时，可以先设为 2；网络和配额稳定后再逐步提高。命令行 `--asr-workers` 会临时覆盖配置文件。
 
 备份并发数通过 `backups.max_workers` 配置，命令行 `--backup-workers` 可临时覆盖。达人目录映射默认缓存 24 小时，由 `backups.mapping_cache_ttl_hours` 控制；需要立即重新确认远端目录时使用 `--refresh-mappings`。
+
+达人主页资料采集默认最多 3 路并发，由 `collection.profile_max_workers` 控制；同一份成功资料在 `collection.profile_ttl_hours`（默认 12 小时）内直接复用。主页 DOM 等待采用最多约 16 秒的条件等待，不再叠加固定 4 秒和多轮长等待。缺少登录态、主页资料或对应飞书记录会返回非零退出码，禁止用旧资料伪装成本轮成功。
 
 ### 运行命令
 
@@ -273,16 +283,19 @@ python .\scripts\run_creator_pipeline.py --creator aligc --feishu-only
 - 夸克上传按达人生成精确 manifest，一次确认目录并批量上传本轮待处理文案，逐作品返回成功或失败。
 - 夸克批次每完成一条就原子保存 checkpoint；子进程意外中断时，父流程只恢复相同 `batch_id` 的已完成结果，未完成项明确记为失败并可精确续跑。
 - 飞书最终文案、IMA 状态、夸克状态、本地知识库状态和最后更新时间按达人调用 Base `records/batch_update` 真正批量写回，每批最多 200 条；批次 checkpoint 支持部分成功和失败项精确续跑。
+- 批量写回与单条写回使用同一套本地知识库状态映射；存在原文但总结待补充时写“内容总结待补充”，而不是“已写入”。
 - 夸克和飞书的真实批次墙钟耗时记录在达人级 `phase_timings`；作品级 `duration_seconds` 按批次作品数分摊，同时保留 `batch_duration_seconds`，避免汇总时把同一批次耗时重复放大。
 - 达人之间的文案处理仍严格串行：当前达人全部作品成功或明确失败后，才进入下一达人。
 
 ## 2026-07 达人并发采集与串行降级
 
 - 信息采集默认使用 3 个并发 worker，可通过 `--collect-workers N` 调整；`--fail-fast` 模式仍保持严格串行和立即停止语义。
+- 配置 `collection.min_publish_date` 后，分页在遇到早于日期边界的作品时立即停止，而不是抓完整页后再过滤。
 - 每个达人使用独立的 MediaCrawler 输出目录、采集状态、运行 bootstrap 和持久化浏览器 profile，避免并发时配置、产物或 Chromium profile 锁互相冲突；首次创建新 profile 时可能需要重新确认登录授权。
 - 每个达人使用独立临时 CDP 端口。默认从 `collection.cdp_port_start=9222` 开始，按配置中的达人顺序以 `collection.cdp_port_stride=10` 递增；例如前三位达人使用 `9222/9232/9242`。也可在达人配置中用 `browser_profile_key` 和 `cdp_port` 单独覆盖。
 - 浏览器和 CDP 端口只在该达人采集期间占用；采集进程退出后自动释放。串行补采复用该达人原有 profile 和端口，不创建新的登录环境。
 - 首轮并发采集失败的达人会在其他并发任务结束后逐个串行补采一次；成功达人不会重复采集。
 - 采集成功的达人立即进入单消费者文案队列，达人之间的文案处理仍严格串行，同一达人内部 ASR 仍按配置并发。
 - 运行摘要记录 `collection_attempts`、`fallback_to_serial`、`parallel_collection_seconds` 和可选的 `serial_retry_seconds`。
+- `run_daily.bat` 分别记录新增达人接入、主流水线、主页采集回写三个退出码；任一阶段失败，Windows 计划任务最终退出码均为非零。
 - 2026-07-20 真实三达人并发验证 `run_id=20260720-121425`：首轮 3/3 成功，均为 `collection_attempts=1`、`fallback_to_serial=false`；墙钟耗时 `105.795` 秒，相比隔离前基准 `725.965` 秒减少约 `85.43%`。本轮没有新增作品，因此未触发 ASR 和交付阶段。

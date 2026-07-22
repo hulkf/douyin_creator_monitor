@@ -100,12 +100,13 @@ class WorkStatusWriterTest(unittest.TestCase):
             ), patch.object(WRITER, "load_base_token", return_value="token"), patch.object(
                 WRITER, "run_lark", side_effect=SystemExit("91403 permission denied"),
             ) as run_lark, patch("builtins.print", side_effect=lambda value: outputs.append(str(value))):
-                WRITER.main(["--manifest", str(manifest)])
+                exit_code = WRITER.main(["--manifest", str(manifest)])
 
         payload = json.loads(outputs[-1])
         self.assertEqual(run_lark.call_count, 1)
         self.assertEqual(payload["results"]["1"]["status"], "failed")
         self.assertEqual(payload["results"]["2"]["status"], "failed")
+        self.assertEqual(exit_code, 1)
 
 
 if __name__ == "__main__":

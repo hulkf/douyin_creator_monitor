@@ -2,7 +2,8 @@
 
 本目录是一个独立自动化子项目，用于监控抖音达人主页、采集作品信息、转写视频音频文案，并把结果写入飞书等下游工具。
 
-- 修改或运行任务前，先阅读本目录的 `README.md`、`MEMORY.md` 和相关 `docs/` 文档。`MEMORY.md` 中记录的审批避坑规则必须优先遵守。
+- 【运行与开发职责划分】本项目的流水线**实际运行不经 Codex / 任何 AI Agent**。运行由 `run_daily.bat` 驱动（双击即可），并已注册为 Windows 定时任务 `DouyinCreatorMonitor`（用仓库根 `install_task.bat` 一次性注册；双击运行，提示权限不足时右键"以管理员身份运行"）。当用户说"运行 / 跑一下"时，Agent 用 `schtasks /run /tn DouyinCreatorMonitor` 一键点燃，真正爬取/写飞书由任务计划程序在沙箱外执行，启动最快、运行期 0 token；**不要**自己 `python run_creator_pipeline.py`（会重新踩 Codex 沙箱审批/网络拦截）。Agent 只负责**改代码、排障、分析日志、改配置**。
+- 改代码或排障前，先阅读本目录的 `README.md`、`MEMORY.md` 和相关 `docs/` 文档。`MEMORY.md` 里的审批避坑记录只在涉及 Codex 运行的历史排障中有参考价值，日常改代码无需重读，也不要为“运行”触发 CodeGraph 全量同步。
 - 默认只处理本目录内的代码、配置、文档和运行产物，不要扫描或修改同级其他项目，除非用户明确要求。
 - 对外部调度入口保持命令行可运行，便于后续接入 Windows 任务计划程序或其他调度器。
 - 本地登录态、密钥、Cookie、飞书 ID、临时音视频、ASR 输出和测试日志放入 `local/`、`runtime/`、`logs/` 或 `output/`，不要提交真实敏感信息。

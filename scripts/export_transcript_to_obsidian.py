@@ -278,15 +278,15 @@ def read_note_template(template_path: Path | None) -> str:
     return DEFAULT_NOTE_TEMPLATE
 
 
-def read_summary_template(template_path: Path | None) -> str:
-    if template_path is None:
+def read_summary_content(summary_path: Path | None) -> str:
+    if summary_path is None:
         return ""
     try:
-        return template_path.read_text(encoding="utf-8-sig").strip("\ufeff\r\n")
+        return summary_path.read_text(encoding="utf-8-sig").strip("\ufeff\r\n")
     except FileNotFoundError as exc:
-        raise ObsidianExportError(f"内容总结模板不存在: {template_path}") from exc
+        raise ObsidianExportError(f"内容总结文件不存在: {summary_path}") from exc
     except OSError as exc:
-        raise ObsidianExportError(f"读取内容总结模板失败: {template_path}") from exc
+        raise ObsidianExportError(f"读取内容总结文件失败: {summary_path}") from exc
 
 
 def add_summary_template_placeholder(template: str) -> str:
@@ -345,6 +345,7 @@ def build_note(
     creator_dir_name: str,
     transcript_path: Path,
     template_path: Path | None,
+    summary_path: Path | None = None,
     summary_template_path: Path | None = None,
 ) -> str:
     desc = str(work.get("desc") or work.get("raw", {}).get("desc") or "").strip()
@@ -356,11 +357,11 @@ def build_note(
     account_id = str(profile.get("账号ID") or "")
     platform = str(profile.get("所属平台") or "抖音")
     template = read_note_template(template_path)
-    summary_template = read_summary_template(summary_template_path)
-    if summary_template:
+    summary_content = read_summary_content(summary_path)
+    if summary_content:
         template = add_summary_template_placeholder(template)
-    summary_template_block = (
-        f"## 内容总结模板\n\n{summary_template}\n" if summary_template else ""
+    summary_block = (
+        f"## 内容总结\n\n{summary_content}\n" if summary_content else ""
     )
     cleaning_rules = extract_cleaning_rules(template)
     formatted_transcript = format_transcript_for_reading(transcript, cleaning_rules)
@@ -389,7 +390,7 @@ def build_note(
             "入库时间": yaml_string(exported_at),
             "入库时间_文本": exported_at,
             "原始文案": formatted_transcript,
-            "内容总结模板": summary_template_block.rstrip(),
+            "内容总结模板": summary_block.rstrip(),
             "正文清洗规则": cleaning_rules,
         },
     )
@@ -437,7 +438,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--creator-dir-name", default="", help="Obsidian 下的达人目录名；不填时使用 creator-name")
     parser.add_argument("--obsidian-original-dir", type=Path, default=DEFAULT_OBSIDIAN_ORIGINAL_DIR, help="Obsidian 原始文案根目录")
     parser.add_argument("--template-file", type=Path, default=DEFAULT_OBSIDIAN_TEMPLATE_FILE, help="Obsidian 原始文案模板文件；模板内 CLEANING_RULES 区块会作为正文清洗规则来源")
-    parser.add_argument("--summary-template-file", type=Path, help="显示在原始文案上方的内容总结/归档提示词模板")
+    parser.add_argument("--summary-file", type=Path, help="已生成的内容总结 Markdown 文件；存在时显示在原始文案上方")
+    parser.add_argument("--summary-template-file", type=Path, help="内容总结提示词模板路径；仅用于上游选择，不会直接写入笔记")
     parser.add_argument("--overwrite", action="store_true", help="目标文件已存在时覆盖")
     parser.add_argument("--ensure-creator-dir-only", action="store_true", help="只确保达人目录存在并输出映射")
     parser.add_argument("--metadata-output", type=Path, help="目录映射 JSON 输出文件")
@@ -448,7 +450,17 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        profile = read_json(args.profile_file) if args.profile_file else {}
+        # 达人资料文件（profile-<key>-update.json）可能尚未产出（新达人首次采集、
+        # 或流水线未接通主页资料抓取）。该文件仅用于笔记里补充账号名/主页等元数据，
+        # 缺失时按空字典处理，绝不因它缺失而中断“建目录 + 写笔记”这一核心动作。
+        profile: dict[str, Any] = {}
+        if args.profile_file and Path(args.profile_file).exists():
+            try:
+                loaded = read_json(args.profile_file)
+                if isinstance(loaded, dict):
+                    profile = loaded
+            except ObsidianExportError:
+                profile = {}
         creator_name = args.creator_name.strip() or str(profile.get("达人昵称") or profile.get("作品表名称") or "未知达人").strip()
         creator_dir_name = args.creator_dir_name.strip() or creator_name
         creator_dir = args.obsidian_original_dir / sanitize_path_part(creator_dir_name, fallback="未知达人")
@@ -478,6 +490,7 @@ def main(argv: list[str] | None = None) -> int:
             creator_dir_name=creator_dir_name,
             transcript_path=args.transcript.resolve(),
             template_path=args.template_file,
+            summary_path=args.summary_file,
             summary_template_path=args.summary_template_file,
         )
         output_path.write_text(note, encoding="utf-8")

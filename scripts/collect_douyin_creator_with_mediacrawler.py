@@ -34,6 +34,49 @@ DEFAULT_OUTPUT_FILE = PROJECT_DIR / "runtime" / "zhiliao-works-from-mediacrawler
 DEFAULT_MEDIA_OUTPUT_DIR = PROJECT_DIR / "runtime" / "mediacrawler-output"
 BEIJING_TZ = timezone(timedelta(hours=8))
 COLLECTION_STATE_VERSION = 1
+
+
+def parse_min_publish_date(value: str | None) -> int | None:
+    """Convert 'YYYY-MM-DD' (Beijing midnight) to a unix cutoff timestamp.
+
+    Returns ``None`` when the value is empty, which disables the date filter.
+    """
+
+    if not value or not str(value).strip():
+        return None
+    text = str(value).strip()
+    parsed: datetime | None = None
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
+        try:
+            parsed = datetime.strptime(text[:10], fmt)
+            break
+        except ValueError:
+            continue
+    if parsed is None:
+        raise SystemExit(f"无法解析 --min-publish-date: {value!r}（应为 YYYY-MM-DD）")
+    return int(parsed.replace(tzinfo=BEIJING_TZ).timestamp())
+
+
+def filter_by_min_publish_date(
+    works: list[dict[str, Any]], cutoff: int | None,
+) -> tuple[list[dict[str, Any]], int]:
+    """Drop works published strictly before ``cutoff`` (unix seconds, Beijing).
+
+    Works without a parseable ``create_time`` are kept (and later validated by
+    ``validate_core_fields``), so a missing date never silently erases a record.
+    """
+
+    if cutoff is None:
+        return works, 0
+    kept: list[dict[str, Any]] = []
+    dropped = 0
+    for work in works:
+        create_time = work.get("create_time")
+        if isinstance(create_time, (int, float)) and create_time < cutoff:
+            dropped += 1
+            continue
+        kept.append(work)
+    return kept, dropped
 FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     "aweme_id": ("aweme_id", "awemeId", "note_id", "id", "作品ID", "抖音作品ID"),
     "desc": ("desc", "title", "display_title", "content", "原始文案", "作品标题"),
@@ -500,6 +543,7 @@ def run_mediacrawler(
 
     bootstrap = output_dir / "_run_mediacrawler_douyin_creator.py"
     creator_id = creator_id_from_url(args.creator_url)
+    cutoff_timestamp = parse_min_publish_date(getattr(args, "min_publish_date", None))
     browser_profile_key = safe_browser_profile_key(
         str(getattr(args, "browser_profile_key", "") or creator_id)
     )
@@ -560,7 +604,9 @@ def run_mediacrawler(
                 f"known_ids = set({sorted(known_ids)!r})",
                 f"probe_count = {max(1, int(args.incremental_probe_count))}",
                 f"report_file = Path({str(report_file)!r})",
-                "if collection_mode == 'incremental':",
+                f"cutoff_timestamp = {cutoff_timestamp!r}",
+                f"max_items = {max(1, int(args.max_count))}",
+                "if collection_mode == 'incremental' or cutoff_timestamp:",
                 "    async def _get_incremental_user_aweme_posts(self, sec_user_id, callback=None):",
                 "        posts_has_more, max_cursor, checked = 1, '', 0",
                 "        result, scanned_ids, seen_ids = [], [], set()",
@@ -575,6 +621,11 @@ def run_mediacrawler(
                 "            selected = []",
                 "            should_stop = False",
                 "            for item in page:",
+                "                created = int(item.get('create_time') or 0)",
+                "                if cutoff_timestamp and created and created < cutoff_timestamp:",
+                "                    should_stop = True",
+                "                    stop_reason = 'min_publish_date'",
+                "                    break",
                 "                work_id = str(item.get('aweme_id') or '')",
                 "                if not work_id or work_id in seen_ids:",
                 "                    continue",
@@ -582,12 +633,16 @@ def run_mediacrawler(
                 "                selected.append(item)",
                 "                scanned_ids.append(work_id)",
                 "                checked += 1",
-                "                if work_id in known_ids:",
+                "                if collection_mode == 'incremental' and work_id in known_ids:",
                 "                    boundary_seen = True",
                 "                    boundary_id = boundary_id or work_id",
                 "                if boundary_seen and checked >= probe_count:",
                 "                    should_stop = True",
                 "                    stop_reason = 'known_boundary'",
+                "                    break",
+                "                if checked >= max_items:",
+                "                    should_stop = True",
+                "                    stop_reason = 'max_count'",
                 "                    break",
                 "            if callback and selected:",
                 "                await callback(selected)",
@@ -640,6 +695,8 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
     creator_id = creator_id_from_url(args.creator_url)
     existing_payload = read_existing_payload(output_file)
     existing_works = works_from_payload(existing_payload)
+    cutoff = parse_min_publish_date(args.min_publish_date)
+    existing_works, existing_dropped = filter_by_min_publish_date(existing_works, cutoff)
     existing_ids = {str(item["aweme_id"]) for item in existing_works}
     state = read_collection_state(state_file)
 
@@ -675,6 +732,18 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
         if media_dir:
             records, used_files = load_records_from_output(media_dir / "data")
     current_works = dedupe_works(records)
+    current_works, current_dropped = filter_by_min_publish_date(current_works, cutoff)
+    if cutoff is not None:
+        total_dropped = existing_dropped + current_dropped
+        if total_dropped:
+            print(
+                f"[collector] 丢弃 {total_dropped} 条早于 {args.min_publish_date} 的作品"
+                f"（已存 {existing_dropped} + 本次 {current_dropped}），不入库。",
+                file=sys.stderr,
+            )
+        report = dict(report)
+        report["min_publish_date"] = args.min_publish_date
+        report["dropped_before_min_publish_date"] = total_dropped
     if args.expect_min_count and len(current_works) < args.expect_min_count:
         raise SystemExit(f"Only found {len(current_works)} works, below --expect-min-count={args.expect_min_count}.")
     if not current_works:
@@ -718,6 +787,11 @@ def main() -> int:
     parser.add_argument("--force-full-collect", action="store_true", help="Ignore the completed baseline marker and crawl all history again.")
     parser.add_argument("--mark-existing-full", action="store_true", help="Mark the existing normalized works file as a complete baseline without network access.")
     parser.add_argument("--max-count", type=int, default=200)
+    parser.add_argument(
+        "--min-publish-date", default=None,
+        help="只采集该日期(含)之后的作品，格式 YYYY-MM-DD（北京时间零点）。"
+             "留空则不限制。默认值由流水线配置 collection.min_publish_date 传入。",
+    )
     parser.add_argument("--expect-min-count", type=int, default=1)
     parser.add_argument("--login-type", default="qrcode", choices=["qrcode", "phone", "cookie"])
     parser.add_argument(

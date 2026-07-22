@@ -116,6 +116,7 @@ class IncrementalCollectionTest(unittest.TestCase):
                     incremental_probe_count=3,
                     browser_profile_key=f"creator-{key}",
                     cdp_port=9222 if key == "a" else 9232,
+                    min_publish_date="2025-01-01",
                 )
                 return COLLECTOR.run_mediacrawler(args, mode="incremental", known_ids=set())
 
@@ -146,6 +147,8 @@ class IncrementalCollectionTest(unittest.TestCase):
             self.assertTrue(all("config.CDP_CONNECT_EXISTING = False" in text for text in bootstrap_texts))
             self.assertTrue(all("kwargs.setdefault('wait_until', 'domcontentloaded')" in text for text in bootstrap_texts))
             self.assertTrue(all("_page_goto_with_retry" in text for text in bootstrap_texts))
+            self.assertTrue(all("cutoff_timestamp = 1735660800" in text for text in bootstrap_texts))
+            self.assertTrue(all("stop_reason = 'min_publish_date'" in text for text in bootstrap_texts))
 
     def test_generated_mediacrawler_patch_stops_at_known_boundary(self):
         with tempfile.TemporaryDirectory() as directory:
