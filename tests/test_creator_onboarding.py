@@ -30,6 +30,27 @@ FIELDS = load_module("creator_table_fields")
 
 
 class CreatorOnboardingTest(unittest.TestCase):
+    def test_profile_sync_creator_filter_does_not_touch_other_creators(self):
+        config = {
+            "creators": [
+                {"key": "a", "creator_url": "https://www.douyin.com/user/sec-a"},
+                {"key": "b", "creator_url": "https://www.douyin.com/user/sec-b"},
+            ]
+        }
+        args = argparse.Namespace(base_token=None, lark_cli="lark-cli", creator=["a"])
+        records = [
+            {"record_id": "rec-a", "fields": {"达人主页地址": "https://www.douyin.com/user/sec-a"}},
+            {"record_id": "rec-b", "fields": {"达人主页地址": "https://www.douyin.com/user/sec-b"}},
+        ]
+        with patch.object(ONBOARD, "load_base_token", return_value="token"), patch.object(
+            ONBOARD, "list_creator_records", return_value=records,
+        ), patch.object(ONBOARD, "sync_profile_to_feishu", return_value=True) as sync:
+            code = ONBOARD.run_sync_profiles(args, config, "tbl", "user")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(sync.call_count, 1)
+        self.assertEqual(sync.call_args.args[4], "a")
+
     def test_collect_failure_blocks_profile_sync(self):
         config = {"feishu": {"creator_table_id": "tbl"}}
         with patch.object(ONBOARD, "load_config", return_value=config), patch.object(

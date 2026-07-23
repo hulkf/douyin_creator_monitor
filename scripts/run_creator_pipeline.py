@@ -531,6 +531,7 @@ def collect_command(
     config: dict[str, Any], creator: dict[str, Any], works_file: Path,
     media_output: Path, collection_state_file: Path, normalize_only: bool,
     force_full_collect: bool = False,
+    profile_output_file: Path | None = None,
 ) -> list[str]:
     defaults = section(config, "collection")
     creator_url = str(creator.get("creator_url") or "").strip()
@@ -564,6 +565,7 @@ def collect_command(
     append_option(command, "--media-crawler-dir", chosen(creator, defaults, "media_crawler_dir"))
     append_option(command, "--media-crawler-python", chosen(creator, defaults, "media_crawler_python"))
     append_option(command, "--min-publish-date", chosen(creator, defaults, "min_publish_date", "2025-01-01"))
+    append_option(command, "--profile-output-file", profile_output_file)
     if chosen(creator, defaults, "clean_media_output", False):
         command.append("--clean-media-output")
     incremental_enabled = bool(chosen(creator, defaults, "incremental_enabled", True))
@@ -580,6 +582,23 @@ def sync_command(config: dict[str, Any], creator: dict[str, Any], works_file: Pa
         raise PipelineError(f"达人 {creator_key(creator)} 缺少 works_table_id。")
     command = py(config, "sync_douyin_works_to_feishu.py", "--works-file", works_file, "--table-id", table)
     append_option(command, "--lark-cli", section(config, "feishu").get("lark_cli"))
+    return command
+
+
+def profile_sync_command(
+    config: dict[str, Any], creator: dict[str, Any], config_path: Path | None = None,
+) -> list[str]:
+    """Sync only this creator's profile artifact produced by the current collection."""
+
+    feishu = section(config, "feishu")
+    command = py(
+        config, "check_and_onboard_new_creators.py",
+        "--sync-profiles", "--creator", creator_key(creator),
+    )
+    append_option(command, "--config", config_path)
+    append_option(command, "--table-id", feishu.get("creator_table_id"))
+    append_option(command, "--lark-cli", feishu.get("lark_cli"))
+    append_option(command, "--as", feishu.get("as_identity"))
     return command
 
 
@@ -1704,7 +1723,9 @@ def collect_creator_phase(
     name = str(creator.get("creator_name") or creator.get("creator_dir_name") or key)
     logger.write(f"========== 达人采集开始: {name} ({key}) ==========")
     works_file = path_from(creator.get("works_file"), PROJECT_DIR / "runtime" / f"{key}-works-from-mediacrawler.json")
-    profile_file = path_from(creator.get("profile_file"))
+    profile_file = path_from(
+        creator.get("profile_file"), PROJECT_DIR / "runtime" / f"profile-{key}-update.json",
+    )
     media_output = path_from(creator.get("media_output_dir"), PROJECT_DIR / "runtime" / f"mediacrawler-output-{key}")
     state_dir = path_from(config.get("state_dir"), DEFAULT_STATE_DIR) or DEFAULT_STATE_DIR
     media_dir = path_from(config.get("media_dir"), DEFAULT_MEDIA_DIR) or DEFAULT_MEDIA_DIR
@@ -1717,6 +1738,7 @@ def collect_creator_phase(
     }
 
     collection_ok = True
+    sync_ok = True
     collection_attempted = not args.skip_collect
     if args.skip_collect:
         logger.write(f"跳过采集 {name}")
@@ -1727,6 +1749,7 @@ def collect_creator_phase(
                 collect_command(
                     config, creator, works_file, media_output, collection_state_file,
                     args.normalize_only, args.force_full_collect,
+                    profile_output_file=profile_file,
                 ),
                 env,
             )
@@ -1736,6 +1759,26 @@ def collect_creator_phase(
             logger.write(f"采集失败 {name}: {exc}")
             if args.fail_fast:
                 raise
+
+    if collection_ok and not args.skip_collect and not args.normalize_only:
+        if args.skip_feishu_sync:
+            logger.write(f"跳过飞书达人资料同步 {name}")
+        else:
+            try:
+                runner.run(
+                    f"飞书达人资料同步 {name}",
+                    profile_sync_command(config, creator, path_from(args.config)),
+                    env,
+                    sensitive=("--table-id", "--base-token"),
+                )
+                result["profile_sync"] = "planned" if args.dry_run else "success"
+            except Exception as exc:
+                sync_ok = False
+                result["profile_sync"] = "failed"
+                result["profile_sync_error"] = str(exc)
+                logger.write(f"飞书达人资料同步失败 {name}: {exc}")
+                if args.fail_fast:
+                    raise
 
     if not works_file.exists():
         if args.dry_run:
@@ -1772,7 +1815,7 @@ def collect_creator_phase(
 
     if not selected:
         result["backup_mappings"] = {}
-        result["status"] = "success" if collection_ok else "partial_failure"
+        result["status"] = "success" if collection_ok and sync_ok else "partial_failure"
         reason = "没有待处理的新作品" if pending_selection else "没有待补录的历史作品"
         logger.write(f"{name} {reason}，跳过飞书、ASR 和备份阶段")
         result["phase_timings"]["collection_and_sync_seconds"] = round(
@@ -1791,7 +1834,6 @@ def collect_creator_phase(
             )
             write_json(state_path, state)
 
-    sync_ok = True
     synced_record_ids: dict[str, str] = {}
     sync_works_file = works_file
     should_limit_sync = bool(requested_ids) or maximum > 0 or pending_selection

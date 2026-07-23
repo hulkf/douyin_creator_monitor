@@ -155,7 +155,7 @@ Obsidian 的 `template_file` 仍是所有达人的通用笔记框架。可用 `s
 
 备份并发数通过 `backups.max_workers` 配置，命令行 `--backup-workers` 可临时覆盖。达人目录映射默认缓存 24 小时，由 `backups.mapping_cache_ttl_hours` 控制；需要立即重新确认远端目录时使用 `--refresh-mappings`。
 
-达人主页资料采集默认最多 3 路并发，由 `collection.profile_max_workers` 控制；同一份成功资料在 `collection.profile_ttl_hours`（默认 12 小时）内直接复用。主页 DOM 等待采用最多约 16 秒的条件等待，不再叠加固定 4 秒和多轮长等待。缺少登录态、主页资料或对应飞书记录会返回非零退出码，禁止用旧资料伪装成本轮成功。
+日常作品采集会复用 MediaCrawler 同一次 `get_user_info` 响应刷新 `runtime/profile-<key>-update.json`，并由该达人的主流水线立即定向回写飞书；不会为了 profile 再启动一轮 Chromium，也不会在 `--creator` 单达人运行时误同步其他达人的旧文件。粉丝数、获赞数、关注数、作品数等本轮核心字段缺失时，采集适配器返回非零退出码，正式 profile 快照保持原样，仅另存 `.partial.json` 排障文件；`--normalize-only` 也不会把历史响应伪装成本轮新数据。独立的 `--collect-profiles --sync-profiles` DOM 采集仍保留为手动排障兜底，其并发和缓存分别由 `collection.profile_max_workers`、`collection.profile_ttl_hours` 控制。
 
 ### 运行命令
 

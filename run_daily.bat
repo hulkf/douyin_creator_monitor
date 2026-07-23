@@ -35,7 +35,6 @@ REM 日志路径用 %~dp0 绝对化：计划任务的工作目录未必是项目
 REM 相对路径 logs\ 会重定向失败且静默吞掉所有输出（曾导致 255 且无日志）。
 set BATLOG=%~dp0logs\bat-%TS%.log
 set NCCLOG=%~dp0logs\new-creator-check-%TS%.log
-set PROFSYNCLOG=%~dp0logs\profile-sync-%TS%.log
 
 echo === Starting pipeline ===
 echo Time: %date% %time%
@@ -67,16 +66,8 @@ echo.
 echo ----- Full output (same as %BATLOG%) -----
 type "%BATLOG%"
 
-REM ---- 主流水线跑完后：先采集达人主页资料，再回写飞书 ----
-REM 1) 采集：用已登录的 Chromium 把 粉丝数/获赞数/作品数/账号名 等
-REM    写到 runtime/profile-<key>-update.json（复用 MediaCrawler 的登录态，免扫码）。
-REM 2) 回写：把本地资料推到飞书《达人基础信息表》统计字段。
-REM 两条合一（--collect-profiles --sync-profiles）保证该抓的字段都能抓到并落库。
-echo.
-echo === Collecting creator homepage profiles, then syncing to Feishu 达人基础信息表 ===
-"%PYTHON_EXE%" "D:\JR_project\douyin_creator_monitor\scripts\check_and_onboard_new_creators.py" --collect-profiles --sync-profiles > "%PROFSYNCLOG%" 2>&1
-set PROFILE_EL=%errorlevel%
-echo    (主页资料采集+回写详情见 %PROFSYNCLOG%)
+REM Creator profile is synced inside the per-creator pipeline immediately after a successful capture.
+REM This avoids writing stale snapshots for other creators during --creator runs.
 
 REM ============================================================
 REM  Final summary block - always shown, success or failure.
@@ -87,14 +78,13 @@ echo #                       RESULT
 echo ############################################################
 set FINAL_EL=%EL%
 if not "%ONBOARD_EL%"=="0" set FINAL_EL=%ONBOARD_EL%
-if not "%PROFILE_EL%"=="0" set FINAL_EL=%PROFILE_EL%
 if "%FINAL_EL%"=="0" (
   echo #  [SUCCESS] Pipeline finished with NO errors.
   echo #  Exit code: 0
 ) else (
   echo #  [FAILED]  Pipeline ended with an ERROR.
   echo #  Exit code: %FINAL_EL%
-  echo #  Stage codes: onboarding=%ONBOARD_EL% pipeline=%EL% profile_sync=%PROFILE_EL%
+  echo #  Stage codes: onboarding=%ONBOARD_EL% pipeline=%EL%
   echo #  >> Check the output above or open the log file.
 )
 echo #  Log file : %BATLOG%

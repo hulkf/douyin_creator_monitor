@@ -486,6 +486,7 @@ def main(argv: list[str] | None = None) -> int:
                         help="离线测试用：直接读 JSON 记录列表，而不调用 lark-cli")
     parser.add_argument("--apply", action="store_true", help="真正建表、改配置、回写信息（默认仅报告）")
     parser.add_argument("--no-collect", action="store_true", help="--apply 时只接入+补全信息，不触发采集（采集交给随后的主流水线）")
+    parser.add_argument("--creator", action="append", default=[], help="只处理指定达人 key，可重复")
     parser.add_argument("--sync-profiles", action="store_true", help="把现有达人本地主页资料回写飞书统计字段")
     parser.add_argument("--collect-profiles", action="store_true",
                         help="采集现有达人主页资料(粉丝数/获赞数/作品数/账号名等)到 runtime/profile-<key>-update.json；"
@@ -751,10 +752,13 @@ def run_sync_profiles(args, config, table_id, as_identity) -> int:
     records = list_creator_records(args.lark_cli, token, table_id, as_identity)
     synced = 0
     skipped = 0
+    requested = set(getattr(args, "creator", []) or [])
     for creator in config.get("creators", []):
         if not creator.get("enabled", True):
             continue
         key = creator_key(creator)
+        if requested and key not in requested:
+            continue
         homepage = normalize_homepage(creator.get("creator_url"))
         record_id = find_record_by_homepage(records, homepage) if homepage else None
         if not record_id:

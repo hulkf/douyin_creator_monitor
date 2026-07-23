@@ -1,6 +1,7 @@
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import importlib.util
+import json
 import sys
 import tempfile
 import unittest
@@ -81,6 +82,100 @@ class IncrementalCollectionTest(unittest.TestCase):
         self.assertEqual(merged[0]["cover_url"], "old cover")
         self.assertEqual(merged[0]["digg_count"], 9)
 
+    def test_captured_creator_response_updates_profile_without_erasing_known_values(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            capture = root / "creator-profile-raw.json"
+            output = root / "profile-demo-update.json"
+            output.write_text(
+                json.dumps({"账号简介": "保留旧简介", "粉丝数": 10}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            capture.write_text(
+                json.dumps(
+                    {
+                        "user": {
+                            "nickname": "测试达人",
+                            "unique_id": "demo123",
+                            "uid": "12345678",
+                            "sec_uid": "sec-demo",
+                            "ip_location": "IP属地：广东",
+                            "province": "广东",
+                            "city": "深圳",
+                            "following_count": 0,
+                            "follower_count": 123,
+                            "total_favorited": "456",
+                            "aweme_count": 7,
+                            "signature": "",
+                            "gender": 2,
+                            "avatar_larger": {"url_list": ["https://example.com/avatar.jpg"]},
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            result = COLLECTOR.update_profile_from_capture(
+                capture,
+                output,
+                "https://www.douyin.com/user/sec-demo",
+            )
+            profile = json.loads(output.read_text(encoding="utf-8"))
+
+            self.assertTrue(result["updated"])
+            self.assertEqual(profile["达人昵称"], "测试达人")
+            self.assertEqual(profile["账号ID"], "demo123")
+            self.assertEqual(profile["抖音UID"], "12345678")
+            self.assertEqual(profile["IP属地"], "广东")
+            self.assertEqual(profile["所在地区"], "广东·深圳")
+            self.assertEqual(profile["性别"], "女")
+            self.assertEqual(profile["关注数"], 0)
+            self.assertEqual(profile["粉丝数"], 123)
+            self.assertEqual(profile["获赞数"], 456)
+            self.assertEqual(profile["作品数"], 7)
+            self.assertEqual(profile["账号简介"], "保留旧简介")
+            self.assertEqual(profile["头像URL"], "https://example.com/avatar.jpg")
+            self.assertEqual(profile["主页采集状态"], "正常")
+            self.assertEqual(profile["账号状态"], "正常")
+
+    def test_partial_profile_capture_does_not_refresh_official_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            capture = root / "creator-profile-raw.json"
+            output = root / "profile-demo-update.json"
+            original = {
+                    "达人昵称": "旧昵称", "关注数": 1, "粉丝数": 99,
+                    "获赞数": 2, "作品数": 3, "最近检查时间": "2026-01-01 00:00:00",
+                }
+            output.write_text(
+                json.dumps(original, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            capture.write_text(
+                json.dumps({"user": {
+                    "nickname": "新昵称", "following_count": 4,
+                    "total_favorited": 5, "aweme_count": 6,
+                }}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            result = COLLECTOR.update_profile_from_capture(
+                capture, output, "https://www.douyin.com/user/sec-demo",
+            )
+            profile = json.loads(output.read_text(encoding="utf-8"))
+            diagnostic = output.with_suffix(".partial.json")
+
+            self.assertFalse(result["updated"])
+            self.assertTrue(result["partial"])
+            self.assertEqual(profile, original)
+            self.assertIn("粉丝数", result["missing_core_fields"])
+            self.assertTrue(diagnostic.is_file())
+            self.assertEqual(
+                json.loads(diagnostic.read_text(encoding="utf-8"))["达人昵称"],
+                "新昵称",
+            )
+
     def test_collection_mode_requires_matching_completed_baseline(self):
         works = [{"aweme_id": "1"}]
         state = {"creator_id": "creator-1", "full_history_collected": True}
@@ -89,6 +184,95 @@ class IncrementalCollectionTest(unittest.TestCase):
         self.assertEqual(COLLECTOR.determine_collection_mode({}, "creator-1", works, False), "full")
         self.assertEqual(COLLECTOR.determine_collection_mode(state, "creator-1", works, True), "full")
         self.assertEqual(COLLECTOR.determine_collection_mode(state, "creator-1", [], False), "full")
+
+    def test_collect_refreshes_profile_from_the_same_mediacrawler_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "run"
+            works_dir = source / "douyin" / "jsonl"
+            works_dir.mkdir(parents=True)
+            (works_dir / "creator_contents_test.jsonl").write_text(
+                json.dumps({
+                    "aweme_id": "work-1", "create_time": 100,
+                    "digg_count": 1, "comment_count": 2,
+                    "collect_count": 3, "share_count": 4,
+                }) + "\n",
+                encoding="utf-8",
+            )
+            (source / "_creator_profile_raw.json").write_text(
+                json.dumps({"user": {
+                    "nickname": "同次采集达人", "unique_id": "same-run",
+                    "sec_uid": "creator-1", "ip_location": "IP属地：广东",
+                    "province": "广东", "city": "深圳", "following_count": 5,
+                    "follower_count": 6, "total_favorited": 7, "aweme_count": 8,
+                }}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            profile_output = root / "profile.json"
+            args = argparse.Namespace(
+                output_file=str(root / "works.json"),
+                collection_state_file=str(root / "collection-state.json"),
+                creator_url="https://www.douyin.com/user/creator-1",
+                min_publish_date=None,
+                mark_existing_full=False,
+                force_full_collect=False,
+                normalize_only=False,
+                media_output_dir=str(root / "media-output"),
+                media_crawler_dir=None,
+                expect_min_count=1,
+                profile_output_file=str(profile_output),
+            )
+
+            with patch.object(
+                COLLECTOR, "run_mediacrawler",
+                return_value=(source, {"mode": "full", "stop_reason": "history_exhausted"}),
+            ):
+                result = COLLECTOR.collect(args)
+
+            profile = json.loads(profile_output.read_text(encoding="utf-8"))
+            self.assertEqual(result["profile_update"]["updated"], True)
+            self.assertEqual(profile["达人昵称"], "同次采集达人")
+            self.assertEqual(profile["粉丝数"], 6)
+            self.assertEqual(profile["获赞数"], 7)
+
+    def test_normalize_only_does_not_present_old_capture_as_fresh_profile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_output = root / "media-output"
+            older = media_output / "runs" / "older"
+            latest = media_output / "runs" / "latest"
+            works_dir = media_output / "douyin" / "jsonl"
+            older.mkdir(parents=True)
+            latest.mkdir(parents=True)
+            works_dir.mkdir(parents=True)
+            (works_dir / "creator_contents_test.jsonl").write_text(
+                json.dumps({
+                    "aweme_id": "work-1", "create_time": 100,
+                    "digg_count": 1, "comment_count": 2,
+                    "collect_count": 3, "share_count": 4,
+                }) + "\n",
+                encoding="utf-8",
+            )
+            for path, nickname in ((older, "旧捕获"), (latest, "最新捕获")):
+                capture = path / "_creator_profile_raw.json"
+                capture.write_text(json.dumps({"user": {
+                    "nickname": nickname, "following_count": 1, "follower_count": 2,
+                    "total_favorited": 3, "aweme_count": 4,
+                }}, ensure_ascii=False), encoding="utf-8")
+            profile_output = root / "profile.json"
+            args = argparse.Namespace(
+                output_file=str(root / "works.json"), collection_state_file=None,
+                creator_url="https://www.douyin.com/user/creator-1",
+                min_publish_date=None, mark_existing_full=False, force_full_collect=False,
+                normalize_only=True, media_output_dir=str(media_output), media_crawler_dir=None,
+                expect_min_count=1, profile_output_file=str(profile_output),
+            )
+
+            result = COLLECTOR.collect(args)
+
+            self.assertFalse(result["profile_update"]["updated"])
+            self.assertTrue(result["profile_update"]["skipped"])
+            self.assertFalse(profile_output.exists())
 
 
     def test_parallel_mediacrawler_runs_use_independent_bootstrap_files(self):
@@ -147,6 +331,8 @@ class IncrementalCollectionTest(unittest.TestCase):
             self.assertTrue(all("config.CDP_CONNECT_EXISTING = False" in text for text in bootstrap_texts))
             self.assertTrue(all("kwargs.setdefault('wait_until', 'domcontentloaded')" in text for text in bootstrap_texts))
             self.assertTrue(all("_page_goto_with_retry" in text for text in bootstrap_texts))
+            self.assertTrue(all("_capture_get_user_info" in text for text in bootstrap_texts))
+            self.assertTrue(all("_creator_profile_raw.json" in text for text in bootstrap_texts))
             self.assertTrue(all("cutoff_timestamp = 1735660800" in text for text in bootstrap_texts))
             self.assertTrue(all("stop_reason = 'min_publish_date'" in text for text in bootstrap_texts))
 
@@ -165,6 +351,12 @@ class IncrementalCollectionTest(unittest.TestCase):
             (package / "client.py").write_text(
                 '''class DouYinClient:\n'''
                 '''    def __init__(self):\n        self.calls = 0\n'''
+                '''    async def get_user_info(self, sec_user_id):\n'''
+                '''        return {"user": {"nickname": "同次采集达人", "unique_id": "same-run",\n'''
+                '''                "sec_uid": sec_user_id, "ip_location": "IP属地：广东",\n'''
+                '''                "province": "广东", "city": "深圳",\n'''
+                '''                "following_count": 5, "follower_count": 6,\n'''
+                '''                "total_favorited": 7, "aweme_count": 8}}\n'''
                 '''    async def get_user_aweme_posts(self, sec_user_id, max_cursor=""):\n'''
                 '''        pages = [[\n'''
                 '''            {"aweme_id": "new-3", "create_time": 103},\n'''
@@ -204,6 +396,7 @@ class IncrementalCollectionTest(unittest.TestCase):
                 '''                detail = await self.get_aweme_detail(item["aweme_id"], semaphore)\n'''
                 '''                if detail is not None:\n                    handle.write(json.dumps(detail) + "\\n")\n'''
                 '''    async def run(self):\n'''
+                '''        await self.dy_client.get_user_info("creator")\n'''
                 '''        await self.dy_client.get_all_user_aweme_posts("creator", callback=self.fetch_creator_video_detail)\n''',
                 encoding="utf-8",
             )
@@ -236,6 +429,24 @@ class IncrementalCollectionTest(unittest.TestCase):
             self.assertEqual(report["checked_count"], 4)
             self.assertEqual(report["known_boundary_aweme_id"], "known-1")
             self.assertEqual(report["stop_reason"], "known_boundary")
+            captured_profile = json.loads(
+                (output_dir / "_creator_profile_raw.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(captured_profile["user"]["nickname"], "同次采集达人")
+
+    def test_cli_returns_two_when_current_profile_is_partial(self):
+        payload = {
+            "count": 1, "collection_mode": "full", "new_count": 1, "pending_count": 1,
+            "profile_update": {
+                "updated": False, "partial": True, "missing_core_fields": ["粉丝数"],
+            },
+        }
+        argv = [
+            "collector", "--creator-url", "creator",
+            "--profile-output-file", "profile.json",
+        ]
+        with patch.object(COLLECTOR, "collect", return_value=payload), patch.object(sys, "argv", argv):
+            self.assertEqual(COLLECTOR.main(), 2)
 
 
 if __name__ == "__main__":

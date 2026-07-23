@@ -994,6 +994,7 @@ class PipelineHelpersTest(unittest.TestCase):
             Path("media-output"),
             Path("collection-state.json"),
             False,
+            profile_output_file=Path("profile.json"),
         )
         self.assertIn("--collection-state-file", command)
         self.assertIn("collection-state.json", command)
@@ -1001,6 +1002,7 @@ class PipelineHelpersTest(unittest.TestCase):
         self.assertNotIn("--force-full-collect", command)
         self.assertEqual(command[command.index("--browser-profile-key") + 1], "demo")
         self.assertEqual(command[command.index("--cdp-port") + 1], "9242")
+        self.assertEqual(command[command.index("--profile-output-file") + 1], "profile.json")
 
         forced = PIPELINE.collect_command(
             config,
@@ -1012,6 +1014,84 @@ class PipelineHelpersTest(unittest.TestCase):
             True,
         )
         self.assertIn("--force-full-collect", forced)
+
+    def test_profile_sync_command_limits_writeback_to_current_creator(self):
+        config = {
+            "python": "python",
+            "feishu": {"creator_table_id": "tbl", "lark_cli": "lark-cli", "as_identity": "user"},
+        }
+
+        command = PIPELINE.profile_sync_command(config, {"key": "demo"})
+
+        self.assertIn("check_and_onboard_new_creators.py", command[1])
+        self.assertIn("--sync-profiles", command)
+        self.assertEqual(command[command.index("--creator") + 1], "demo")
+
+    def test_creator_collection_syncs_current_profile_before_no_new_works_exit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            works_file = root / "works.json"
+            works_file.write_text(json.dumps({"works": []}), encoding="utf-8")
+            creator = {
+                "key": "demo", "creator_name": "示例",
+                "creator_url": "https://www.douyin.com/user/sec-demo",
+                "works_file": str(works_file),
+                "profile_file": str(root / "profile.json"),
+                "media_output_dir": str(root / "media-output"),
+            }
+            config = {
+                "python": "python", "state_dir": str(root / "state"),
+                "media_dir": str(root / "media"),
+                "feishu": {"creator_table_id": "tbl"},
+            }
+            args = argparse.Namespace(
+                config=root / "pipeline.json", skip_collect=False, normalize_only=False,
+                force_full_collect=False, skip_feishu_sync=False, fail_fast=False,
+                dry_run=False, max_works=None, aweme_id=[], backfill_existing=False,
+            )
+            runner = Mock()
+
+            context = PIPELINE.collect_creator_phase(
+                config, creator, runner, PIPELINE.Logger(root / "log.txt", persist=False), {}, args,
+            )
+
+            labels = [call.args[0] for call in runner.run.call_args_list]
+            self.assertEqual(labels, ["采集 示例", "飞书达人资料同步 示例"])
+            self.assertEqual(context["result"]["profile_sync"], "success")
+            self.assertTrue(context["terminal"])
+
+    def test_failed_collection_never_syncs_stale_profile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            works_file = root / "works.json"
+            works_file.write_text(json.dumps({"works": []}), encoding="utf-8")
+            creator = {
+                "key": "demo", "creator_name": "示例",
+                "creator_url": "https://www.douyin.com/user/sec-demo",
+                "works_file": str(works_file),
+                "profile_file": str(root / "profile.json"),
+                "media_output_dir": str(root / "media-output"),
+            }
+            config = {
+                "python": "python", "state_dir": str(root / "state"),
+                "media_dir": str(root / "media"),
+                "feishu": {"creator_table_id": "tbl"},
+            }
+            args = argparse.Namespace(
+                config=root / "pipeline.json", skip_collect=False, normalize_only=False,
+                force_full_collect=False, skip_feishu_sync=False, fail_fast=False,
+                dry_run=False, max_works=None, aweme_id=[], backfill_existing=False,
+            )
+            runner = Mock()
+            runner.run.side_effect = PIPELINE.PipelineError("profile partial")
+
+            context = PIPELINE.collect_creator_phase(
+                config, creator, runner, PIPELINE.Logger(root / "log.txt", persist=False), {}, args,
+            )
+
+            self.assertEqual(runner.run.call_count, 1)
+            self.assertEqual(context["result"]["status"], "partial_failure")
+            self.assertNotIn("profile_sync", context["result"])
 
 
     def test_backfill_selection_advances_after_local_completion(self):

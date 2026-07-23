@@ -34,6 +34,13 @@ DEFAULT_OUTPUT_FILE = PROJECT_DIR / "runtime" / "zhiliao-works-from-mediacrawler
 DEFAULT_MEDIA_OUTPUT_DIR = PROJECT_DIR / "runtime" / "mediacrawler-output"
 BEIJING_TZ = timezone(timedelta(hours=8))
 COLLECTION_STATE_VERSION = 1
+# Fields that must come from this run's user-profile response. Other required
+# Feishu fields are generated here (URL/status/check time) or derived from works
+# later (last post time).
+PROFILE_CORE_FIELDS = (
+    "达人昵称", "账号ID", "IP属地", "所在地区",
+    "关注数", "粉丝数", "获赞数", "作品数",
+)
 
 
 def parse_min_publish_date(value: str | None) -> int | None:
@@ -213,6 +220,163 @@ def first_url(value: Any) -> str | None:
             if found:
                 return found
     return None
+
+
+def _profile_candidate(payload: Any, expected_sec_uid: str) -> dict[str, Any] | None:
+    """Find the creator user object inside a MediaCrawler user-profile response."""
+
+    profile_keys = {
+        "nickname", "unique_id", "short_id", "uid", "sec_uid", "signature",
+        "follower_count", "following_count", "total_favorited", "aweme_count",
+    }
+    candidates: list[tuple[int, dict[str, Any]]] = []
+
+    def visit(node: Any) -> None:
+        if isinstance(node, dict):
+            score = sum(key in node for key in profile_keys)
+            sec_uid = str(node.get("sec_uid") or node.get("secUid") or "").strip()
+            if expected_sec_uid and sec_uid == expected_sec_uid:
+                score += 100
+            if score:
+                candidates.append((score, node))
+            for value in node.values():
+                visit(value)
+        elif isinstance(node, list):
+            for value in node:
+                visit(value)
+
+    visit(payload)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item[0])[1]
+
+
+def _profile_location(user: dict[str, Any]) -> str | None:
+    parts: list[str] = []
+    for key in ("province", "city", "district"):
+        value = str(user.get(key) or "").strip()
+        if value and value not in {"未知", "其他"} and value not in parts:
+            parts.append(value)
+    return "·".join(parts) or None
+
+
+def _profile_gender(value: Any) -> str | None:
+    text = str(value or "").strip()
+    return {"1": "男", "2": "女", "0": "未知", "男": "男", "女": "女", "未知": "未知"}.get(text)
+
+
+def normalize_creator_profile_response(
+    payload: dict[str, Any], creator_url: str, *, captured_at: str | None = None,
+) -> dict[str, Any] | None:
+    """Normalize MediaCrawler's ``get_user_info`` response to this project's profile schema."""
+
+    expected_sec_uid = creator_id_from_url(creator_url)
+    user = _profile_candidate(payload, expected_sec_uid)
+    if not user:
+        return None
+
+    sec_uid = str(first_present(user, ("sec_uid", "secUid")) or expected_sec_uid).strip()
+    douyin_uid = str(first_present(user, ("uid", "uid_str")) or "").strip()
+    if not douyin_uid.isdigit() or douyin_uid == sec_uid:
+        douyin_uid = ""
+    ip_location = str(first_present(user, ("ip_location", "ipLocation")) or "").strip()
+    ip_location = re.sub(r"^IP\s*属地\s*[:：]?\s*", "", ip_location, flags=re.IGNORECASE)
+    account_id = str(first_present(user, ("unique_id", "uniqueId", "short_id", "shortId")) or "").strip()
+    captured = captured_at or now_beijing()
+    profile: dict[str, Any] = {
+        "达人昵称": first_present(user, ("nickname", "nick_name")),
+        "达人主页地址": creator_url,
+        "所属平台": "抖音",
+        "账号ID": account_id,
+        "抖音UID": douyin_uid,
+        "SecUID": sec_uid,
+        "IP属地": ip_location,
+        "所在地区": _profile_location(user),
+        "性别": _profile_gender(user.get("gender")),
+        "关注数": as_int(first_present(user, ("following_count", "followingCount"))),
+        "粉丝数": as_int(first_present(user, ("follower_count", "followerCount"))),
+        "获赞数": as_int(first_present(user, ("total_favorited", "totalFavorited"))),
+        "作品数": as_int(first_present(user, ("aweme_count", "awemeCount"))),
+        "账号简介": first_present(user, ("signature", "desc")),
+        "头像URL": first_url(first_present(user, ("avatar_larger", "avatar_medium", "avatar_thumb", "avatar"))),
+        "最近检查时间": captured,
+        "主页采集状态": "正常",
+        "账号状态": "正常",
+        "主页原始数据": {
+            "source": "mediacrawler_user_profile_api",
+            "captured_at": captured + "+08:00",
+        },
+    }
+    return {
+        key: value for key, value in profile.items()
+        if value is not None and value != "" and value != {} and value != []
+    }
+
+
+def merge_profile(existing: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
+    """Refresh fields obtained this run without erasing known values with blanks."""
+
+    merged = dict(existing)
+    for key, value in current.items():
+        if value is not None and value != "" and value != {} and value != []:
+            merged[key] = value
+    return merged
+
+
+def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_file = path.with_suffix(path.suffix + ".tmp")
+    temp_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_file.replace(path)
+
+
+def update_profile_from_capture(
+    capture_file: Path, profile_output_file: Path, creator_url: str,
+) -> dict[str, Any]:
+    """Normalize one captured creator response and atomically refresh the profile artifact."""
+
+    if not capture_file.is_file():
+        return {"updated": False, "reason": "creator_profile_response_missing"}
+    try:
+        payload = json.loads(capture_file.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"updated": False, "reason": f"creator_profile_response_invalid: {exc}"}
+    if not isinstance(payload, dict):
+        return {"updated": False, "reason": "creator_profile_response_not_object"}
+    current = normalize_creator_profile_response(payload, creator_url)
+    if not current:
+        return {"updated": False, "reason": "creator_profile_user_not_found"}
+    missing = [
+        key for key in PROFILE_CORE_FIELDS
+        if current.get(key) is None or current.get(key) == ""
+    ]
+    if missing:
+        diagnostic_file = profile_output_file.with_suffix(".partial.json")
+        write_json_atomic(diagnostic_file, current)
+        return {
+            "updated": False,
+            "partial": True,
+            "reason": "creator_profile_core_fields_missing",
+            "missing_core_fields": missing,
+            "diagnostic_file": str(diagnostic_file),
+        }
+
+    existing: dict[str, Any] = {}
+    if profile_output_file.is_file():
+        try:
+            loaded = json.loads(profile_output_file.read_text(encoding="utf-8-sig"))
+            if isinstance(loaded, dict):
+                existing = loaded
+        except (OSError, json.JSONDecodeError):
+            pass
+    merged = merge_profile(existing, current)
+    write_json_atomic(profile_output_file, merged)
+    return {
+        "updated": True,
+        "output_file": str(profile_output_file),
+        "updated_fields": sorted(current),
+        "missing_core_fields": [],
+    }
 
 
 def normalize_record(record: dict[str, Any]) -> dict[str, Any] | None:
@@ -540,6 +704,7 @@ def run_mediacrawler(
     output_dir = output_root / "runs" / run_id
     output_dir.mkdir(parents=True, exist_ok=True)
     report_file = output_dir / "_collection_report.json"
+    creator_profile_report_file = output_dir / "_creator_profile_raw.json"
 
     bootstrap = output_dir / "_run_mediacrawler_douyin_creator.py"
     creator_id = creator_id_from_url(args.creator_url)
@@ -604,6 +769,7 @@ def run_mediacrawler(
                 f"known_ids = set({sorted(known_ids)!r})",
                 f"probe_count = {max(1, int(args.incremental_probe_count))}",
                 f"report_file = Path({str(report_file)!r})",
+                f"creator_profile_report_file = Path({str(creator_profile_report_file)!r})",
                 f"cutoff_timestamp = {cutoff_timestamp!r}",
                 f"max_items = {max(1, int(args.max_count))}",
                 "if collection_mode == 'incremental' or cutoff_timestamp:",
@@ -657,6 +823,15 @@ def run_mediacrawler(
                 "        report_file.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')",
                 "        return result",
                 "    DouYinClient.get_all_user_aweme_posts = _get_incremental_user_aweme_posts",
+                "_original_get_user_info = getattr(DouYinClient, 'get_user_info', None)",
+                "if _original_get_user_info is not None:",
+                "    async def _capture_get_user_info(self, sec_user_id):",
+                "        result = await _original_get_user_info(self, sec_user_id)",
+                "        temp = creator_profile_report_file.with_suffix(creator_profile_report_file.suffix + '.tmp')",
+                "        temp.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')",
+                "        temp.replace(creator_profile_report_file)",
+                "        return result",
+                "    DouYinClient.get_user_info = _capture_get_user_info",
                 f"config.DY_CREATOR_ID_LIST = [{creator_id!r}]",
                 f"config.CRAWLER_MAX_NOTES_COUNT = {int(args.max_count)}",
                 f"config.SAVE_DATA_OPTION = {args.save_data_option!r}",
@@ -723,6 +898,22 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
     else:
         source_dir, report = run_mediacrawler(args, mode=mode, known_ids=existing_ids)
 
+    profile_update: dict[str, Any] | None = None
+    profile_output_value = str(getattr(args, "profile_output_file", "") or "").strip()
+    if profile_output_value:
+        if args.normalize_only:
+            profile_update = {
+                "updated": False,
+                "skipped": True,
+                "reason": "normalize_only_has_no_current_profile_capture",
+            }
+        else:
+            profile_update = update_profile_from_capture(
+                source_dir / "_creator_profile_raw.json",
+                Path(profile_output_value).expanduser().resolve(),
+                args.creator_url,
+            )
+
     records, used_files = load_records_from_output(source_dir)
     if not records and args.normalize_only:
         try:
@@ -767,6 +958,8 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
         full_history_collected=full_history_collected, new_ids=new_ids,
         pending_ids=pending_ids, report=report,
     )
+    if profile_update is not None:
+        payload["profile_update"] = profile_update
     write_payload(payload, output_file)
     write_collection_state(
         state_file, creator_id=creator_id, full_history_collected=full_history_collected,
@@ -782,6 +975,10 @@ def main() -> int:
     parser.add_argument("--media-crawler-python", help="Python executable with MediaCrawler dependencies. Defaults to MEDIACRAWLER_PYTHON or MediaCrawler/.venv.")
     parser.add_argument("--media-output-dir", default=str(DEFAULT_MEDIA_OUTPUT_DIR))
     parser.add_argument("--output-file", default=str(DEFAULT_OUTPUT_FILE))
+    parser.add_argument(
+        "--profile-output-file",
+        help="把同一次 MediaCrawler get_user_info 响应规范化写入该 profile JSON。",
+    )
     parser.add_argument("--collection-state-file", help="Per-creator incremental collection state JSON.")
     parser.add_argument("--incremental-probe-count", type=int, default=3, help="Minimum newest works inspected before stopping at a known work.")
     parser.add_argument("--force-full-collect", action="store_true", help="Ignore the completed baseline marker and crawl all history again.")
@@ -811,13 +1008,19 @@ def main() -> int:
     if not 1 <= args.cdp_port <= 65535:
         parser.error("--cdp-port must be between 1 and 65535")
     payload = collect(args)
+    profile_update = payload.get("profile_update") or {}
     print(json.dumps({
         "output_file": str(Path(args.output_file)),
         "count": payload["count"],
         "collection_mode": payload.get("collection_mode"),
         "new_count": payload.get("new_count", 0),
         "pending_count": payload.get("pending_count", 0),
+        "profile_update": profile_update or None,
     }, ensure_ascii=False, indent=2))
+    if args.profile_output_file and not args.normalize_only and (
+        not profile_update.get("updated") or profile_update.get("missing_core_fields")
+    ):
+        return 2
     return 0
 
 
