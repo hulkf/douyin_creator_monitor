@@ -199,6 +199,19 @@ def comparable_schema_value(value: Any) -> Any:
     return value
 
 
+# Options the pipeline does NOT require to pre-exist in the live table, because
+# feishu_work_status_writer.py auto-creates them on write (single-select options are
+# created lazily by lark-cli when first written). They may legitimately be absent from
+# a work table, so the schema validator must not treat their absence as a mismatch.
+ALLOWED_MISSING_OPTIONS = frozenset({"内容总结待补充"})
+
+
+def _option_names(options: Any) -> set[str]:
+    if not isinstance(options, (list, tuple)):
+        return set()
+    return {str(o.get("name")) for o in options if isinstance(o, dict) and o.get("name")}
+
+
 def schema_mismatches(live_fields: list[dict[str, Any]]) -> list[str]:
     live_by_name = {str(field.get("name")): field for field in live_fields}
     problems: list[str] = []
@@ -211,9 +224,21 @@ def schema_mismatches(live_fields: list[dict[str, Any]]) -> list[str]:
         if actual.get("type") != expected.get("type"):
             problems.append(f"{name}: type expected {expected.get('type')}, got {actual.get('type')}")
             continue
-        for key in ("style", "multiple", "options"):
+        # style / multiple are compared exactly (order/cosmetic-insensitive via
+        # comparable_schema_value's sorted-key normalization).
+        for key in ("style", "multiple"):
             if key in expected and comparable_schema_value(actual.get(key)) != comparable_schema_value(expected.get(key)):
                 problems.append(f"{name}: {key} mismatch")
+        # options: compare by NAME SET, not as an ordered list. Single-select option
+        # ORDER and cosmetic attributes (hue/lightness) drift naturally (options are
+        # auto-created by the status writer in arbitrary order) and are not
+        # semantically meaningful, so they must not trigger a schema mismatch.
+        # Only flag options genuinely missing from the live field — and even then,
+        # ignore those the writer auto-creates on demand.
+        if "options" in expected:
+            missing = (_option_names(expected["options"]) - _option_names(actual.get("options"))) - ALLOWED_MISSING_OPTIONS
+            if missing:
+                problems.append(f"{name}: options missing {sorted(missing)}")
     return problems
 
 

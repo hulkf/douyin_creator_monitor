@@ -19,9 +19,13 @@ pipeline.json 配置的达人，并按以下规则处理：
 - --apply：真正建表、改配置、回写信息。日常自动化用 --apply --no-collect
   （只接入+补全信息，采集交给随后的主流水线，避免重复抓）。
 - --sync-profiles：把现有达人（含本次新接入）本地主页资料回写飞书统计字段。
+- --reconcile：对账自愈，扫描 pipeline.json 每个达人的飞书「基础记录/作品表」是否还在；
+  不带 --apply 仅预览，带 --apply 自动重建缺失对象并回写本地统计资料（恢复被删的
+  ID/关注/粉丝等数据）。此模式用于误删飞书对象后的恢复，不依赖 detect-new。
 
 注意：当前项目流水线并未自动产出 profile-<key>-update.json（仅早期有遗留文件），
-因此统计字段回写（--sync-profiles）在资料产出前为空操作；资料采集接通后自动生效。
+因此统计字段回写（--sync-profiles / --reconcile 的 profile 回写）在资料产出前为空操作；
+资料采集接通后自动生效。
 """
 
 from __future__ import annotations
@@ -379,6 +383,102 @@ def upsert_base_info_fields(
 
 
 # --------------------------------------------------------------------------
+# 对账自愈（--reconcile）辅助函数
+# --------------------------------------------------------------------------
+def _search_record_id(node: Any) -> str | None:
+    """从 lark 任意返回结构里递归找出第一个 rec* 记录 ID。"""
+    if isinstance(node, str) and node.startswith("rec"):
+        return node
+    if isinstance(node, list):
+        for x in node:
+            r = _search_record_id(x)
+            if r:
+                return r
+    if isinstance(node, dict):
+        rid = node.get("record_id") or node.get("id")
+        if isinstance(rid, str) and rid.startswith("rec"):
+            return rid
+        for v in node.values():
+            r = _search_record_id(v)
+            if r:
+                return r
+    return None
+
+
+def create_base_record(
+    cli: str, base_token: str, table_id: str, patch: dict[str, Any], as_identity: str
+) -> str:
+    """新建一条达人基础信息表记录（不带 record-id 的 upsert = 创建），返回新 record_id。
+
+    与 upsert_base_info_fields 的区别：后者更新已有记录，本函数用于记录被删后重建。
+    """
+    patch = {k: v for k, v in patch.items() if v not in (None, "", [], {})}
+    if not patch:
+        raise RuntimeError("无可写入字段，无法创建达人基础记录")
+    payload = run_lark(
+        cli,
+        [
+            "base", "+record-upsert",
+            "--base-token", base_token,
+            "--table-id", table_id,
+            "--json", json.dumps(patch, ensure_ascii=False),
+            "--format", "json",
+            "--as", as_identity,
+        ],
+    )
+    rid = _search_record_id(payload)
+    if not rid or not rid.startswith("rec"):
+        raise RuntimeError(f"建记录后无法解析新 record_id：{json.dumps(payload, ensure_ascii=False)[:300]}")
+    return rid
+
+
+def table_exists(cli: str, base_token: str, table_id: str, as_identity: str) -> bool:
+    """列出 base 下的数据表，判断某个 table_id 是否还存在（用于检测作品表被删）。"""
+    payload = run_lark(
+        cli,
+        [
+            "base", "+table-list",
+            "--base-token", base_token,
+            "--limit", "100",
+            "--format", "json",
+            "--as", as_identity,
+        ],
+    )
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    tables = data.get("tables") if isinstance(data.get("tables"), list) else []
+    return any(
+        isinstance(t, dict) and (t.get("id") or t.get("table_id")) == table_id
+        for t in tables
+    )
+
+
+def build_onboard_patch(
+    creator: dict[str, Any], works_tbl: str, sec_uid: str, platform: str,
+    nickname: str, creator_type: str,
+) -> dict[str, Any]:
+    """构造用于「新建/重建达人基础记录」的字段 patch（与接入期字段规则一致）。"""
+    display = creator.get("creator_name") or creator.get("creator_dir_name") or creator_key(creator)
+    patch: dict[str, Any] = {
+        "所属平台": platform,
+        "SecUID": sec_uid,
+        "最近检查时间": beijing_now(),
+        "主页采集状态": "已接入监控",
+    }
+    if nickname:
+        patch["达人昵称"] = nickname
+    if creator_type:
+        patch["达人类型"] = creator_type
+    if works_tbl:
+        patch[WORKS_TABLE_NAME_FIELD] = display
+        patch[WORKS_TABLE_ID_FIELD] = works_tbl
+        link = f"{wiki_link()}?table={works_tbl}" if wiki_link() else ""
+        if link:
+            patch[WORKS_TABLE_LINK_FIELD] = link
+    patch, _ = validate_onboard_patch(patch, sec_uid)
+    return patch
+
+
+# --------------------------------------------------------------------------
 # 把本地主页资料回写飞书统计字段
 # --------------------------------------------------------------------------
 PROFILE_FIELDS_TO_SYNC = [
@@ -486,8 +586,13 @@ def main(argv: list[str] | None = None) -> int:
                         help="离线测试用：直接读 JSON 记录列表，而不调用 lark-cli")
     parser.add_argument("--apply", action="store_true", help="真正建表、改配置、回写信息（默认仅报告）")
     parser.add_argument("--no-collect", action="store_true", help="--apply 时只接入+补全信息，不触发采集（采集交给随后的主流水线）")
-    parser.add_argument("--creator", action="append", default=[], help="只处理指定达人 key，可重复")
     parser.add_argument("--sync-profiles", action="store_true", help="把现有达人本地主页资料回写飞书统计字段")
+    parser.add_argument("--creator", action="append", default=[], help="只处理指定达人 key，可重复")
+    parser.add_argument("--reconcile", action="store_true",
+                        help="对账自愈：扫描 pipeline.json 每个达人，检查飞书侧基础记录/作品表是否还在；"
+                             "缺失则自动重建（基础记录、作品表），并回写结构字段与本地统计资料。")
+    parser.add_argument("--no-profile-sync", action="store_true",
+                        help="--reconcile --apply 时跳过「用本地资料回写粉丝/关注/获赞等统计字段」这一步")
     parser.add_argument("--collect-profiles", action="store_true",
                         help="采集现有达人主页资料(粉丝数/获赞数/作品数/账号名等)到 runtime/profile-<key>-update.json；"
                              "可与 --sync-profiles 连用，先采集再回写飞书")
@@ -508,6 +613,17 @@ def main(argv: list[str] | None = None) -> int:
         rc = run_collect_profiles(args, config)
         if rc != 0 or not args.sync_profiles:
             return rc
+    # ---- 模式：对账自愈（--reconcile）----
+    if args.reconcile:
+        if args.records_file:
+            raw = json.loads(args.records_file.read_text(encoding="utf-8-sig"))
+            records = [
+                {"record_id": r.get("record_id", f"rec{i}"), "fields": r.get("fields", r)}
+                for i, r in enumerate(raw)
+            ]
+        else:
+            records = None
+        return run_reconcile(args, config, table_id, as_identity, records)
     # ---- 模式 1：回写统计字段 ----
     if args.sync_profiles:
         return run_sync_profiles(args, config, table_id, as_identity)
@@ -533,23 +649,36 @@ def main(argv: list[str] | None = None) -> int:
 
     existing_keys = {str(c.get("key")) for c in config.get("creators", [])}
     exit_code = 0
+    venv_python, collector_path, browser_data = _resolve_media_crawler_paths(config)
     for rec in new:
         fields = rec["fields"]
         homepage_url = plain_url(fields.get(HOMEPAGE_FIELD))
         nickname = str(fields.get(NICKNAME_FIELD) or "").strip()
-        if args.apply and not nickname:
-            exit_code = 1
-            print(
-                f"  错误：记录 {rec['record_id']} 缺少达人昵称，已跳过接入，避免用哈希占位名创建作品表。",
-                file=sys.stderr,
-            )
-            continue
+        creator_type = str(fields.get(TYPE_FIELD) or "").strip()
+
         homepage = normalize_homepage(homepage_url)
         existing_works_tbl = str(fields.get(WORKS_TABLE_ID_FIELD) or "").strip()
         key = derive_key(nickname, homepage_url, existing_keys)
         display_name = nickname or key
         sec_uid = sec_uid_from_url(homepage_url)
         platform = platform_from_url(homepage_url)
+
+        # 仅提供主页链接（昵称留空）时：进入达人主页自动抓取真实昵称。
+        # 复用任意可用登录态目录（或全新目录）读取公开主页；解析已做校验，
+        # 登录墙页面会丢弃结果，留到 step3 建立登录态后由资料采集补全。
+        if args.apply and not nickname:
+            print(f"  记录 {rec['record_id']} 未提供达人昵称，尝试进入主页自动抓取…")
+            fetched = _auto_fetch_nickname(homepage_url, venv_python, collector_path, browser_data)
+            if fetched:
+                nickname = fetched
+                display_name = nickname
+                print(f"  已自动抓取昵称：{nickname}")
+            else:
+                print(
+                    f"  [提示] 自动抓取昵称未成功，将以主页标识(sec_uid)暂命名，"
+                    f"后续建立登录态后由资料采集补全。",
+                    file=sys.stderr,
+                )
 
         plan = {
             "record_id": rec["record_id"],
@@ -558,7 +687,7 @@ def main(argv: list[str] | None = None) -> int:
             "derived_key": key,
             "existing_works_table": existing_works_tbl or None,
             "will_create_table": not existing_works_tbl,
-            "creator_type": str(fields.get(TYPE_FIELD) or "").strip(),
+            "creator_type": creator_type,
             "sec_uid": sec_uid,
             "platform": platform,
         }
@@ -577,8 +706,11 @@ def main(argv: list[str] | None = None) -> int:
             "最近检查时间": beijing_now(),
             "主页采集状态": "已接入监控",
         }
-        if not nickname:
-            patch["达人昵称"] = display_name  # 用户留空则补全显示名
+        # 仅在有真实昵称时回写，避免用哈希占位名污染「达人昵称」字段
+        if nickname:
+            patch["达人昵称"] = nickname
+        if creator_type:
+            patch["达人类型"] = creator_type
 
         if not new_tbl:
             new_tbl = create_works_table(args.lark_cli, load_base_token(args.base_token), display_name, as_identity)
@@ -781,6 +913,245 @@ def run_sync_profiles(args, config, table_id, as_identity) -> int:
             skipped += 1
     print(f"统计字段回写完成，成功 {synced} 个，跳过 {skipped} 个。")
     return 1 if skipped else 0
+
+
+def run_reconcile(args, config, table_id, as_identity, records=None) -> int:
+    """对账自愈：检查 pipeline.json 中每个达人，在飞书侧的「基础记录」与「作品表」是否还在。
+
+    背景：流水线读 pipeline.json，不依赖飞书；若某达人的基础记录或作品表在飞书被手动
+    删除，系统原本只会静默跳过（资料同步找不到 record_id、作品同步往已删的表写报错），
+    既不报警也不自愈。本模式扫描后自动重建缺失对象：
+
+    - 基础记录缺失 → 用 --apply 新建达人基础记录，写入接入期字段（所属平台/SecUID/
+      最近检查时间/主页采集状态/作品表名称·ID·链接/达人昵称若有）。
+    - 作品表缺失（pipeline.json 里的 works_table_id 指向已删的表，或根本没有）→ 用
+      --apply 新建同名作品表（沿用 CANONICAL_WORK_FIELDS 规范），并回写 pipeline.json
+      的 works_table_id，使其与飞书对齐；同时修正基础记录里指向旧表的指针。
+    - 基础记录存在但作品表指针是旧的 → 自动修正基础记录里的作品表名称/ID/链接。
+    - 最后用本地 runtime/profile-<key>-update.json 把粉丝/关注/获赞等统计字段回写
+      （--no-profile-sync 可跳过），从而恢复被删的 ID/关注/粉丝数据。
+
+    不带 --apply 仅打印「缺失项 + 将执行动作」（预览）；--apply 才真正写飞书并改配置。
+    records 为 None 时实时拉取飞书；传入则用于离线测试（--records-file）。
+    """
+    print("=== 对账自愈：检查 pipeline.json 达人在飞书的对象完整性 ===")
+    if records is None:
+        token = load_base_token(args.base_token)
+        records = list_creator_records(args.lark_cli, token, table_id, as_identity)
+    else:
+        token = None  # 离线测试：不真正调用 lark-cli 写操作（预览模式也不会写）
+
+    # 建索引：homepage / sec_uid / record_id -> {record_id, fields}
+    by_homepage: dict[str, dict[str, Any]] = {}
+    by_secuid: dict[str, dict[str, Any]] = {}
+    for rec in records:
+        f = rec["fields"]
+        hp = normalize_homepage(f.get(HOMEPAGE_FIELD))
+        su = str(f.get("SecUID") or "").strip()
+        if hp:
+            by_homepage.setdefault(hp, rec)
+        if su:
+            by_secuid.setdefault(su, rec)
+
+    changed_config = False
+    created_records = 0
+    created_tables = 0
+    fixed_records = 0
+    skipped = 0
+
+    for creator in config.get("creators", []):
+        if not creator.get("enabled", True):
+            continue
+        key = creator_key(creator)
+        creator_url = creator.get("creator_url")
+        homepage = normalize_homepage(creator_url)
+        sec = sec_uid_from_url(creator_url)
+        display = creator.get("creator_name") or creator.get("creator_dir_name") or key
+        platform = platform_from_url(creator_url)
+        nickname = str(creator.get("creator_name") or "").strip()
+        expected_tbl = str(creator.get("works_table_id") or "").strip()
+
+        if not homepage and not sec:
+            print(f"  ⚠️  {key}: pipeline.json 缺少 creator_url，无法定位，跳过")
+            skipped += 1
+            continue
+
+        # 1) 基础记录是否存在
+        hit = (by_homepage.get(homepage) if homepage else None) or (by_secuid.get(sec) if sec else None)
+        rec_id = hit["record_id"] if hit else None
+        base_missing = not rec_id
+
+        # 2) 作品表是否存在
+        works_missing = bool(expected_tbl) and not table_exists(args.lark_cli, token, expected_tbl, as_identity)
+        if not expected_tbl:
+            # 根本没有作品表引用——视为需要（重新）建表以恢复结构完整
+            works_missing = True
+
+        if not base_missing and not works_missing:
+            # 额外：基础记录里保存的作品表指针是否与 pipeline.json 一致（防陈旧指针）
+            stored_tbl = str((hit or {}).get("fields", {}).get(WORKS_TABLE_ID_FIELD) or "").strip()
+            if stored_tbl and stored_tbl != expected_tbl:
+                if args.apply:
+                    upsert_base_info_fields(
+                        args.lark_cli, token, table_id, rec_id,
+                        {WORKS_TABLE_NAME_FIELD: display, WORKS_TABLE_ID_FIELD: expected_tbl,
+                         **({"作品表链接": f"{wiki_link()}?table={expected_tbl}"} if wiki_link() else {})},
+                        as_identity,
+                    )
+                    fixed_records += 1
+                    print(f"  ✅ {key}: 已修正基础记录里的作品表指针 -> {expected_tbl}")
+                else:
+                    print(f"  ⚠️  {key}: 基础记录作品表指针陈旧（存 {stored_tbl}，应为 {expected_tbl}），预览将修正")
+            else:
+                print(f"  ✅ {key}: 基础记录与作品表均完整")
+                skipped += 1
+            continue
+
+        issues = []
+        if base_missing:
+            issues.append("基础记录缺失")
+        if works_missing:
+            issues.append("作品表缺失" + (f"（指向已删表 {expected_tbl}）" if expected_tbl else "（无引用）"))
+        print(f"  ⚠️  {key}: " + "，".join(issues))
+
+        actual_tbl = expected_tbl
+        # —— 重建作品表 ——
+        if works_missing:
+            if not args.apply:
+                print(f"      [预览] 将新建作品表并重写 pipeline.json 的 works_table_id")
+            else:
+                actual_tbl = create_works_table(args.lark_cli, token, display, as_identity)
+                creator["works_table_id"] = actual_tbl
+                changed_config = True
+                created_tables += 1
+                print(f"      ✅ 已重建作品表 {actual_tbl}（原 pipeline 引用 {expected_tbl or '空'}）")
+
+        # —— 重建/修正基础记录 ——
+        if base_missing:
+            patch = build_onboard_patch(creator, actual_tbl, sec, platform, nickname, "")
+            if not args.apply:
+                print(f"      [预览] 将新建达人基础记录，写入字段: {', '.join(patch.keys())}")
+            else:
+                rec_id = create_base_record(args.lark_cli, token, table_id, patch, as_identity)
+                created_records += 1
+                print(f"      ✅ 已新建达人基础记录 {rec_id}")
+        else:
+            # 记录还在，但作品表指针可能陈旧 → 修正
+            if works_missing and actual_tbl:
+                if args.apply:
+                    fix = {WORKS_TABLE_NAME_FIELD: display, WORKS_TABLE_ID_FIELD: actual_tbl}
+                    if wiki_link():
+                        fix[WORKS_TABLE_LINK_FIELD] = f"{wiki_link()}?table={actual_tbl}"
+                    upsert_base_info_fields(args.lark_cli, token, table_id, rec_id, fix, as_identity)
+                    fixed_records += 1
+                    print(f"      ✅ 已修正基础记录 {rec_id} 的作品表指针 -> {actual_tbl}")
+
+        # —— 回写统计字段（粉丝/关注/获赞等），恢复被删的 ID/关注/粉丝数据 ——
+        if args.apply and not args.no_profile_sync and rec_id:
+            if sync_profile_to_feishu(args.lark_cli, token, table_id, as_identity, key, rec_id, creator):
+                print(f"      ✅ 已从本地资料回写统计字段到 {rec_id}")
+            else:
+                print(f"      ℹ️  {key} 本地无 profile-<key>-update.json，跳过统计回写（下次采集后自动补齐）")
+
+    if args.apply and changed_config:
+        save_config(args.config, config)
+        print("已更新 pipeline.json（works_table_id 已修正）。")
+    print(
+        f"对账完成：正常跳过 {skipped}，新建基础记录 {created_records}，"
+        f"重建作品表 {created_tables}，修正记录 {fixed_records}。"
+    )
+    return 0
+
+
+def _resolve_media_crawler_paths(config: dict[str, Any]) -> tuple[str, str, Path]:
+    """Return (venv_python, collector_script_path, browser_data_dir) for profile collection."""
+    collection = config.get("collection", {})
+    venv_python = str(collection.get("media_crawler_python") or "")
+    collector = PROJECT_DIR / "scripts" / "collect_douyin_creator_profile.py"
+    if collection.get("media_crawler_dir"):
+        media_crawler_dir = Path(str(collection["media_crawler_dir"])).resolve()
+    elif venv_python:
+        media_crawler_dir = Path(venv_python).resolve().parents[1]
+    else:
+        media_crawler_dir = PROJECT_DIR
+    browser_data = media_crawler_dir / "browser_data"
+    return venv_python, str(collector), browser_data
+
+
+def _find_any_login_dir(browser_data: Path) -> str | None:
+    """Pick an existing logged-in Chromium dir to reuse for a one-off nickname probe.
+
+    A brand-new creator has no own login dir yet, but reusing any existing one lets
+    us read a *public* homepage reliably (logged-in) to grab the nickname. The page
+    DOM is parsed for the visited creator, so browsing as another account only reads
+    the target's public profile.
+    """
+    if not browser_data or not Path(browser_data).exists():
+        return None
+    matches = [
+        p for p in sorted(Path(browser_data).iterdir())
+        if p.is_dir() and p.name.endswith("_dy_user_data_dir")
+    ]
+    return str(matches[0]) if matches else None
+
+
+def _auto_fetch_nickname(creator_url: str, venv_python: str, collector_path: str,
+                         browser_data: Path) -> str:
+    """Enter the creator's homepage and grab the real nickname from the DOM.
+
+    Runs the collector as a *subprocess* under ``venv_python`` (the same MediaCrawler
+    venv that already has Playwright + a browser installed). Reuses an existing login
+    dir if available, else a fresh (logged-out) persistent context. Returns the
+    nickname, or '' on any failure / unreliable (login-wall) result. Never raises —
+    onboarding must not hard-fail just because the probe failed.
+    """
+    if not venv_python or not collector_path or not Path(collector_path).exists():
+        return ""
+    probe_dir = _find_any_login_dir(browser_data)
+    if not probe_dir:
+        probe_dir = str(PROJECT_DIR / "runtime" / ".onboard_probe_udir")
+    probe_out = PROJECT_DIR / "runtime" / ".onboard_nickname_probe.json"
+    try:
+        cmd = [
+            venv_python, str(collector_path),
+            "--creator-url", str(creator_url),
+            "--user-data-dir", str(probe_dir),
+            "--output", str(probe_out),
+            "--headless",
+        ]
+        proc = subprocess.run(cmd, cwd=PROJECT_DIR, capture_output=True, text=True, timeout=120)
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [自动抓昵称] 调用采集器失败：{exc}", file=sys.stderr)
+        return ""
+    if proc.returncode != 0:
+        msg = (proc.stderr or proc.stdout or "").strip().replace("\n", " ")[:200]
+        print(f"  [自动抓昵称] 采集器退出码 {proc.returncode}：{msg}", file=sys.stderr)
+        return ""
+    # 采集器 main() 仅打印 result JSON；解析其中的 ok / nickname
+    try:
+        result = json.loads(proc.stdout or "{}")
+    except Exception:
+        result = {}
+    if not (isinstance(result, dict) and result.get("ok")):
+        return ""
+    nick = str(result.get("nickname") or "").strip()
+    if not nick:
+        return ""
+    # 可靠性校验：未登录/登录墙页面会返回错误的固定占位名（如「AI抖音」），
+    # 必须丢弃，留到建立登录态后由 step3 的主页资料采集正确补全。
+    debug_path = probe_out.with_suffix(".debug.json")
+    try:
+        dbg = json.loads(debug_path.read_text(encoding="utf-8"))
+        if dbg.get("dom_has_login_button"):
+            print(
+                "  [自动抓昵称] 页面处于登录墙，结果不可靠已丢弃"
+                "（将在建立登录态后由主页资料采集自动补全）。",
+                file=sys.stderr,
+            )
+            return ""
+    except Exception:
+        pass
+    return nick
 
 
 def creator_key(creator: dict[str, Any]) -> str:

@@ -527,6 +527,39 @@ def collection_slot(config: dict[str, Any], creator: dict[str, Any]) -> int:
     return 0
 
 
+# --- 登录态复用 ---------------------------------------------------------
+# 抖音采集必须有“已登录的抖音会话”。达人自己的浏览器目录（cdp_<key>_dy_user_data_dir）
+# 若没有效登录（空壳：Cookies 文件极小 / 缺失），MediaCrawler 会退回扫码登录，
+# 而无人值守运行没人扫 → 永久卡死。故：自身目录无效时，自动复用任意一个
+# 有有效登录态的已有目录去采该达人的【公开】作品（只需“某个已登录账号”，
+# 不要求是本人），与 check_and_onboard_new_creators._auto_fetch_nickname 复用登录态同理。
+VALID_LOGIN_MIN_BYTES = 35000  # 真实登录 Cookies ≈45KB；空壳 SQLite 初始为 32768
+
+
+def _user_data_dir_for_key(browser_data: Path, profile_key: str) -> Path:
+    """cdp_browser.py 实际使用的目录名：cdp_<profile_key>_dy_user_data_dir。"""
+    return browser_data / f"cdp_{profile_key}_dy_user_data_dir"
+
+
+def _has_valid_login(udir: Path) -> bool:
+    cookies = udir / "Default" / "Network" / "Cookies"
+    try:
+        return cookies.exists() and cookies.stat().st_size > VALID_LOGIN_MIN_BYTES
+    except OSError:
+        return False
+
+
+def _find_fallback_profile_key(browser_data: Path, exclude_key: str) -> str | None:
+    """返回第一个有有效登录态的已有 profile_key（排除 exclude_key）。"""
+    if not browser_data or not browser_data.exists():
+        return None
+    for p in sorted(browser_data.glob("cdp_*_dy_user_data_dir")):
+        key = p.name[len("cdp_"):-len("_dy_user_data_dir")]
+        if key and key != exclude_key and _has_valid_login(p):
+            return key
+    return None
+
+
 def collect_command(
     config: dict[str, Any], creator: dict[str, Any], works_file: Path,
     media_output: Path, collection_state_file: Path, normalize_only: bool,
@@ -538,6 +571,20 @@ def collect_command(
     if not creator_url:
         raise PipelineError(f"达人 {creator_key(creator)} 缺少 creator_url。")
     profile_key = str(chosen(creator, defaults, "browser_profile_key", creator_key(creator)))
+    # 登录态复用：自身目录没有效登录（空壳/缺失）时，自动改用
+    # 任意一个有有效登录态的已有目录，避免无人值守卡在扫码登录。
+    media_dir = Path(str(chosen(creator, defaults, "media_crawler_dir") or "")).expanduser()
+    browser_data = (media_dir / "browser_data") if media_dir else (PROJECT_DIR / "browser_data")
+    own_udir = _user_data_dir_for_key(browser_data, profile_key)
+    if not _has_valid_login(own_udir):
+        fb = _find_fallback_profile_key(browser_data, profile_key)
+        if fb:
+            print(
+                f"[采集] 达人 {creator_key(creator)} 自身登录态缺失/为空壳，"
+                f"自动复用已有有效登录态（profile_key={fb}）。",
+                file=sys.stderr,
+            )
+            profile_key = fb
     try:
         port_start = int(chosen(creator, defaults, "cdp_port_start", 9222))
         port_stride = int(chosen(creator, defaults, "cdp_port_stride", 10))

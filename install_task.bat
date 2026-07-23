@@ -10,12 +10,11 @@ REM  Usage: double-click this file (Run as Admin if needed)
 REM ============================================================
 
 set TN=DouyinCreatorMonitor
-set BAT=D:\JR_project\douyin_creator_monitor\run_daily.bat
+set REGISTER_SCRIPT=%~dp0scripts\register_scheduled_task.ps1
 
-REM 每天 03:00 运行（不要用 /sc ONCE /sd 过去日期，那是 9009 隐患源）。
-REM 若需无人值守（用户未登录也跑），请在任务计划程序里把该任务的
-REM "安全选项"改为"不管用户是否登录都要运行"并保存密码；或在此加 /ru <用户> /rp <密码>。
-schtasks /create /tn %TN% /tr "%BAT% --no-pause" /sc DAILY /st 03:00 /f
+REM Run daily at 03:00. The PowerShell helper also sets a stable cmd launcher
+REM and project working directory. Interactive logon avoids storing a password.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%REGISTER_SCRIPT%"
 set CREATE_EL=%errorlevel%
 if "%CREATE_EL%"=="0" schtasks /query /tn %TN% >nul 2>&1
 if not "%errorlevel%"=="0" set CREATE_EL=%errorlevel%

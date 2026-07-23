@@ -18,47 +18,51 @@ cd /d "D:\JR_project\douyin_creator_monitor"
 
 set PYTHON_EXE=D:\Anaconda\python.exe
 set PIPELINE=D:\JR_project\douyin_creator_monitor\scripts\run_creator_pipeline.py
+REM Keep redirected Python output UTF-8 for every stage, including reconcile.
+set PYTHONIOENCODING=utf-8
 
 REM ---- parse args without goto/labels (labels fail in some hosts) ----
-REM  RAW holds every argument passed to this bat. PYARGS is RAW with
-REM  every "--no-pause" token stripped out, so only real pipeline
-REM  flags reach Python. NOPAUSE is detected via findstr.
-set "RAW=%*"
-set "PYARGS=%RAW:--no-pause=%"
+REM  RAW always starts with a sentinel space. Without it, cmd expands the
+REM  substitution on an empty %* to the literal "--no-pause=". The same
+REM  space also keeps forwarded flags separated from the Python script path.
+set "RAW= %*"
+set "PYARGS=%RAW: --no-pause=%"
 echo.%RAW% | findstr /i /c:"--no-pause" >nul 2>&1 && set NOPAUSE=1 || set NOPAUSE=0
 
 REM Locale-independent timestamp for the bat-level log file.
 REM (powershell -UFormat avoids the single-quote clash that the
 REM  python one-liner hits inside a for/f '...' command.)
 for /f "delims=" %%i in ('powershell -NoProfile -Command "Get-Date -UFormat %%Y%%m%%d-%%H%%M%%S"') do set TS=%%i
-REM 日志路径用 %~dp0 绝对化：计划任务的工作目录未必是项目目录，
-REM 相对路径 logs\ 会重定向失败且静默吞掉所有输出（曾导致 255 且无日志）。
+REM Use absolute log paths because Task Scheduler may use another working directory.
+REM Relative redirection can fail before Python starts and hide all output.
 set BATLOG=%~dp0logs\bat-%TS%.log
 set NCCLOG=%~dp0logs\new-creator-check-%TS%.log
+set RECONLOG=%~dp0logs\reconcile-%TS%.log
 
 echo === Starting pipeline ===
 echo Time: %date% %time%
 echo Command: "%PYTHON_EXE%" "%PIPELINE%"%PYARGS%
 echo.
 
-REM ---- 每次运行前检查飞书《达人基础信息表》是否有新增达人 ----
-REM 自动接入：发现新增达人即 --apply --no-collect
-REM   · 加入日常更新数据（写入 pipeline.json creators）
-REM   · 把信息补充完全：建作品表(若无) + 回写 作品表关联/所属平台/SecUID/
-REM     抖音UID/最近检查时间/主页采集状态/达人昵称 到基础信息表
-REM 真正的采集交给随后的主流水线（--no-collect 避免重复抓）。
-REM 若只想看报告不接入，可手动加 --dry-run 运行该脚本。
-echo === Checking & auto-onboarding new creators from 达人基础信息表 ===
+REM ---- Reconcile the creator base table before collection. ----
+REM Recreate missing creator rows or work tables and repair stale pointers.
+REM The main pipeline refreshes current profile statistics after collection.
+echo === Reconcile creator base records and work tables ===
+"%PYTHON_EXE%" "D:\JR_project\douyin_creator_monitor\scripts\check_and_onboard_new_creators.py" --reconcile --apply > "%RECONLOG%" 2>&1
+set RECON_EL=%errorlevel%
+echo    (reconcile details: %RECONLOG%)
+echo.
+
+REM ---- Discover and configure creators newly added to the base table. ----
+echo === Checking and auto-onboarding new creators ===
 "%PYTHON_EXE%" "D:\JR_project\douyin_creator_monitor\scripts\check_and_onboard_new_creators.py" --apply --no-collect > "%NCCLOG%" 2>&1
 set ONBOARD_EL=%errorlevel%
-echo    (新增达人接入详情见 %NCCLOG%)
+echo    (onboarding details: %NCCLOG%)
 echo.
 
 REM Run the pipeline. All stdout/stderr (including any Python crash
 REM traceback) is captured to %BATLOG% so nothing is lost on error.
-REM PYTHONIOENCODING ensures Chinese text is written as UTF-8 in the log
-REM file (without this, Windows defaults to GBK and type shows garbled text).
-set PYTHONIOENCODING=utf-8
+REM Python output is captured in the bat-level log for diagnostics.
 "%PYTHON_EXE%" "%PIPELINE%"%PYARGS% > "%BATLOG%" 2>&1
 set EL=%errorlevel%
 
@@ -77,6 +81,7 @@ echo ############################################################
 echo #                       RESULT
 echo ############################################################
 set FINAL_EL=%EL%
+if not "%RECON_EL%"=="0" set FINAL_EL=%RECON_EL%
 if not "%ONBOARD_EL%"=="0" set FINAL_EL=%ONBOARD_EL%
 if "%FINAL_EL%"=="0" (
   echo #  [SUCCESS] Pipeline finished with NO errors.
@@ -84,7 +89,7 @@ if "%FINAL_EL%"=="0" (
 ) else (
   echo #  [FAILED]  Pipeline ended with an ERROR.
   echo #  Exit code: %FINAL_EL%
-  echo #  Stage codes: onboarding=%ONBOARD_EL% pipeline=%EL%
+  echo #  Stage codes: reconcile=%RECON_EL% onboarding=%ONBOARD_EL% pipeline=%EL%
   echo #  >> Check the output above or open the log file.
 )
 echo #  Log file : %BATLOG%

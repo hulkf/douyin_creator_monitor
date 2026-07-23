@@ -18,6 +18,7 @@ validate_<stage>_patch()，确保「不写少、不写漏、不写错」。
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
@@ -53,7 +54,8 @@ FIELD_RULES: dict[str, dict[str, Any]] = {
     "账号ID":     dict(owner=PROFILE, required=True,  kind="str", note="抖音号 handle，如 zaoweilai8（不是数字 UID）"),
     "IP属地":     dict(owner=PROFILE, required=True,  kind="str"),
     "所在地区":   dict(owner=PROFILE, required=True,  kind="str"),
-    "性别":       dict(owner=PROFILE, required=True,  kind="enum:男,女,未知"),
+    "性别":       dict(owner=PROFILE, required=False, kind="enum:男,女,未知",
+                       note="抖音主页常不暴露性别，非必填；抓到才填，无则不写（不覆盖历史值）"),
     "关注数":     dict(owner=PROFILE, required=True,  kind="int"),
     "粉丝数":     dict(owner=PROFILE, required=True,  kind="int"),
     "获赞数":     dict(owner=PROFILE, required=True,  kind="int"),
@@ -134,9 +136,19 @@ def _check_kind(kind: str | None, value: Any) -> str | None:
             return "应为 YYYY-MM-DD HH:MM:SS"
         return None
     if kind == "json":
-        if not isinstance(value, (dict, list)):
+        if isinstance(value, (dict, list)):
+            return None
+        if isinstance(value, str):
+            # 飞书文本字段只能存字符串，采集方常将 dict/list 预先 json.dumps 成字符串。
+            # 只要能被解析为 dict/list 即视为合法；否则才不合法（避免把明文误当 JSON 丢弃）。
+            try:
+                parsed = json.loads(value)
+            except (TypeError, ValueError):
+                return "应为 JSON 对象/数组（或合法 JSON 字符串）"
+            if isinstance(parsed, (dict, list)):
+                return None
             return "应为 JSON 对象/数组"
-        return None
+        return "应为 JSON 对象/数组"
     if kind == "numeric_or_empty":
         if _is_empty(value):
             return None

@@ -139,6 +139,31 @@ class IncrementalCollectionTest(unittest.TestCase):
             self.assertEqual(profile["主页采集状态"], "正常")
             self.assertEqual(profile["账号状态"], "正常")
 
+    def test_ip_location_fills_region_when_profile_has_no_province_or_city(self):
+        payload = {
+            "user": {
+                "nickname": "测试达人",
+                "unique_id": "demo123",
+                "uid": "12345678",
+                "sec_uid": "sec-demo",
+                "ip_location": "IP属地：广东",
+                "following_count": 0,
+                "follower_count": 123,
+                "total_favorited": 456,
+                "aweme_count": 7,
+            }
+        }
+
+        profile = COLLECTOR.normalize_creator_profile_response(
+            payload,
+            "https://www.douyin.com/user/sec-demo",
+            captured_at="2026-07-23 09:00:00",
+        )
+
+        self.assertIsNotNone(profile)
+        self.assertEqual(profile["IP属地"], "广东")
+        self.assertEqual(profile["所在地区"], "广东")
+
     def test_partial_profile_capture_does_not_refresh_official_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -329,12 +354,139 @@ class IncrementalCollectionTest(unittest.TestCase):
                 },
             )
             self.assertTrue(all("config.CDP_CONNECT_EXISTING = False" in text for text in bootstrap_texts))
+            self.assertTrue(all("config.HEADLESS = not interactive_login" in text for text in bootstrap_texts))
+            self.assertTrue(all("config.CDP_HEADLESS = not interactive_login" in text for text in bootstrap_texts))
+            self.assertTrue(all("'--headless', 'false' if interactive_login else 'true'" in text for text in bootstrap_texts))
+            self.assertTrue(all("--no-startup-window" in text for text in bootstrap_texts))
+            self.assertTrue(all("_close_new_blank_chrome_windows" in text for text in bootstrap_texts))
+            self.assertTrue(all("subprocess.CREATE_NO_WINDOW" in text for text in bootstrap_texts))
+            self.assertTrue(all("INTERACTIVE_LOGIN_EXIT_CODE" in text for text in bootstrap_texts))
             self.assertTrue(all("kwargs.setdefault('wait_until', 'domcontentloaded')" in text for text in bootstrap_texts))
             self.assertTrue(all("_page_goto_with_retry" in text for text in bootstrap_texts))
             self.assertTrue(all("_capture_get_user_info" in text for text in bootstrap_texts))
             self.assertTrue(all("_creator_profile_raw.json" in text for text in bootstrap_texts))
             self.assertTrue(all("cutoff_timestamp = 1735660800" in text for text in bootstrap_texts))
             self.assertTrue(all("stop_reason = 'min_publish_date'" in text for text in bootstrap_texts))
+
+    def test_mediacrawler_command_bypasses_relocated_venv_launcher(self):
+        with tempfile.TemporaryDirectory() as directory:
+            media = Path(directory) / "MediaCrawler"
+            greenlet_dir = media / ".venv" / "Lib" / "site-packages" / "greenlet"
+            greenlet_dir.mkdir(parents=True)
+            abi_tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
+            (greenlet_dir / f"_greenlet.{abi_tag}-win_amd64.pyd").write_bytes(b"")
+            bootstrap = media / "bootstrap.py"
+
+            with patch.object(COLLECTOR.os, "name", "nt"):
+                command = COLLECTOR.build_mediacrawler_command(
+                    media, str(media / ".venv" / "Scripts" / "python.exe"), bootstrap,
+                )
+
+            self.assertEqual(command[:3], [sys.executable, "-S", "-c"])
+            self.assertEqual(command[-1], str(bootstrap))
+            self.assertIn(repr(str(media / ".venv" / "Lib" / "site-packages")), command[3])
+
+    def test_mediacrawler_failure_still_closes_its_isolated_chrome(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            media = root / "MediaCrawler"
+            media.mkdir()
+            (media / "main.py").write_text("", encoding="utf-8")
+            args = argparse.Namespace(
+                media_crawler_dir=str(media),
+                media_crawler_python=sys.executable,
+                media_output_dir=str(root / "output"),
+                clean_media_output=False,
+                creator_url="creator-a",
+                max_count=200,
+                save_data_option="jsonl",
+                login_type="qrcode",
+                incremental_probe_count=3,
+                browser_profile_key="creator-a",
+                cdp_port=9222,
+                min_publish_date="2025-01-01",
+            )
+
+            with patch.object(
+                COLLECTOR.subprocess, "run", return_value=argparse.Namespace(returncode=1)
+            ), patch.object(COLLECTOR, "cleanup_mediacrawler_chrome") as cleanup:
+                with self.assertRaises(SystemExit):
+                    COLLECTOR.run_mediacrawler(args, mode="incremental", known_ids=set())
+
+            cleanup.assert_called_once_with("creator-a", 9222)
+
+    def test_mediacrawler_reopens_visibly_only_when_login_is_required(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            media = root / "MediaCrawler"
+            media.mkdir()
+            (media / "main.py").write_text("", encoding="utf-8")
+            args = argparse.Namespace(
+                media_crawler_dir=str(media),
+                media_crawler_python=sys.executable,
+                media_output_dir=str(root / "output"),
+                clean_media_output=False,
+                creator_url="creator-a",
+                max_count=200,
+                save_data_option="jsonl",
+                login_type="qrcode",
+                incremental_probe_count=3,
+                browser_profile_key="creator-a",
+                cdp_port=9222,
+                min_publish_date="2025-01-01",
+            )
+            calls = []
+
+            def run_external(command, **kwargs):
+                calls.append(kwargs["env"].get(COLLECTOR.INTERACTIVE_LOGIN_ENV))
+                code = COLLECTOR.INTERACTIVE_LOGIN_EXIT_CODE if len(calls) == 1 else 0
+                return argparse.Namespace(returncode=code)
+
+            with patch.object(COLLECTOR.subprocess, "run", side_effect=run_external), patch.object(
+                COLLECTOR, "cleanup_mediacrawler_chrome",
+            ) as cleanup:
+                COLLECTOR.run_mediacrawler(args, mode="incremental", known_ids=set())
+
+            self.assertEqual(calls, [None, "1"])
+            self.assertEqual(cleanup.call_count, 2)
+            cleanup.assert_called_with("creator-a", 9222)
+
+    def test_chrome_cleanup_does_not_close_unrelated_user_browser(self):
+        class FakeProcess:
+            def __init__(self, pid, command_line):
+                self.pid = pid
+                self.info = {"pid": pid, "name": "chrome.exe", "cmdline": command_line}
+                self.terminated = False
+
+            def children(self, recursive=False):
+                return []
+
+            def terminate(self):
+                self.terminated = True
+
+            def kill(self):
+                raise AssertionError("graceful termination should be enough")
+
+        project_chrome = FakeProcess(
+            101,
+            ["chrome.exe", "--user-data-dir=D:/MediaCrawler/browser_data/cdp_creator-a_dy_user_data_dir"],
+        )
+        user_chrome = FakeProcess(202, ["chrome.exe", "--profile-directory=Default"])
+        fake_psutil = argparse.Namespace(
+            NoSuchProcess=RuntimeError,
+            AccessDenied=PermissionError,
+            process_iter=lambda attrs: [project_chrome, user_chrome],
+            wait_procs=lambda processes, timeout: (processes, []),
+        )
+
+        with patch.object(COLLECTOR.os, "name", "nt"), patch.dict(
+            sys.modules, {"psutil": fake_psutil}
+        ):
+            closed = COLLECTOR.cleanup_mediacrawler_chrome("creator-a", 9222)
+
+        self.assertEqual(closed, [101])
+        self.assertTrue(project_chrome.terminated)
+        self.assertFalse(user_chrome.terminated)
 
     def test_generated_mediacrawler_patch_stops_at_known_boundary(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -373,6 +525,10 @@ class IncrementalCollectionTest(unittest.TestCase):
                 '''        items = response["aweme_list"]\n'''
                 '''        if callback:\n            await callback(items)\n'''
                 '''        return items\n''',
+                encoding="utf-8",
+            )
+            (package / "login.py").write_text(
+                "class DouYinLogin:\n    async def begin(self):\n        return None\n",
                 encoding="utf-8",
             )
             (package / "core.py").write_text(

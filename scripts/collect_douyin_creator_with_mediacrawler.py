@@ -34,6 +34,8 @@ DEFAULT_OUTPUT_FILE = PROJECT_DIR / "runtime" / "zhiliao-works-from-mediacrawler
 DEFAULT_MEDIA_OUTPUT_DIR = PROJECT_DIR / "runtime" / "mediacrawler-output"
 BEIJING_TZ = timezone(timedelta(hours=8))
 COLLECTION_STATE_VERSION = 1
+INTERACTIVE_LOGIN_EXIT_CODE = 86
+INTERACTIVE_LOGIN_ENV = "DOUYIN_INTERACTIVE_LOGIN"
 # Fields that must come from this run's user-profile response. Other required
 # Feishu fields are generated here (URL/status/check time) or derived from works
 # later (last post time).
@@ -120,6 +122,59 @@ def safe_browser_profile_key(value: str) -> str:
     return normalized if normalized not in {"", ".", ".."} else "creator"
 
 
+def cleanup_mediacrawler_chrome(browser_profile_key: str, cdp_port: int) -> list[int]:
+    """Close only Chrome processes launched for one isolated MediaCrawler profile."""
+
+    if os.name != "nt":
+        return []
+    try:
+        import psutil
+    except ImportError:
+        print("[collector] warning: psutil unavailable; Chrome cleanup skipped", file=sys.stderr)
+        return []
+
+    profile_marker = f"{safe_browser_profile_key(browser_profile_key)}_dy_user_data_dir".lower()
+    matches = []
+    for process in psutil.process_iter(["pid", "name", "cmdline"]):
+        try:
+            if str(process.info.get("name") or "").lower() != "chrome.exe":
+                continue
+            command_line = " ".join(process.info.get("cmdline") or []).lower()
+            if profile_marker in command_line:
+                matches.append(process)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+    targets: dict[int, Any] = {}
+    for process in matches:
+        try:
+            for child in process.children(recursive=True):
+                targets[child.pid] = child
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+        targets[process.pid] = process
+
+    closed: list[int] = []
+    for process in targets.values():
+        try:
+            process.terminate()
+            closed.append(process.pid)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    _, alive = psutil.wait_procs(list(targets.values()), timeout=3)
+    for process in alive:
+        try:
+            process.kill()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    if closed:
+        print(
+            f"[collector] closed {len(closed)} Chrome processes "
+            f"for profile={browser_profile_key} cdp_port={cdp_port}"
+        )
+    return closed
+
+
 def resolve_media_crawler_dir(value: str | None) -> Path:
     media_dir = Path(value or os.environ.get("MEDIACRAWLER_DIR", "")).expanduser()
     if not str(media_dir) or not (media_dir / "main.py").exists():
@@ -137,6 +192,33 @@ def resolve_media_crawler_python(media_dir: Path, value: str | None) -> str:
     if local_venv_python.exists():
         return str(local_venv_python)
     return sys.executable
+
+
+def build_mediacrawler_command(
+    media_dir: Path, configured_python: str | None, bootstrap: Path,
+) -> list[str]:
+    """Run MediaCrawler with the dependency ABI that matches this pipeline Python.
+
+    Some managed Python installations rewrite ``.venv/pyvenv.cfg`` when the
+    environment is opened, even though the installed native wheels still target
+    the old interpreter. On Windows we can safely bypass that unstable launcher:
+    use the already-running pipeline interpreter with ``-S`` and expose only the
+    MediaCrawler venv's matching site-packages directory.
+    """
+
+    site_packages = media_dir / ".venv" / "Lib" / "site-packages"
+    abi_tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
+    greenlet_dir = site_packages / "greenlet"
+    matching_native_wheel = any(greenlet_dir.glob(f"_greenlet.{abi_tag}-*.pyd"))
+    if os.name == "nt" and site_packages.exists() and matching_native_wheel:
+        runner = (
+            "import runpy,sys; "
+            f"sys.path.insert(0, {str(site_packages)!r}); "
+            "target=sys.argv[1]; sys.argv=[target]; "
+            "runpy.run_path(target, run_name='__main__')"
+        )
+        return [sys.executable, "-S", "-c", runner, str(bootstrap)]
+    return [resolve_media_crawler_python(media_dir, configured_python), str(bootstrap)]
 
 
 def as_int(value: Any) -> int | None:
@@ -251,13 +333,13 @@ def _profile_candidate(payload: Any, expected_sec_uid: str) -> dict[str, Any] | 
     return max(candidates, key=lambda item: item[0])[1]
 
 
-def _profile_location(user: dict[str, Any]) -> str | None:
+def _profile_location(user: dict[str, Any], ip_location: str = "") -> str | None:
     parts: list[str] = []
     for key in ("province", "city", "district"):
         value = str(user.get(key) or "").strip()
         if value and value not in {"未知", "其他"} and value not in parts:
             parts.append(value)
-    return "·".join(parts) or None
+    return "·".join(parts) or ip_location or None
 
 
 def _profile_gender(value: Any) -> str | None:
@@ -291,7 +373,7 @@ def normalize_creator_profile_response(
         "抖音UID": douyin_uid,
         "SecUID": sec_uid,
         "IP属地": ip_location,
-        "所在地区": _profile_location(user),
+        "所在地区": _profile_location(user, ip_location),
         "性别": _profile_gender(user.get("gender")),
         "关注数": as_int(first_present(user, ("following_count", "followingCount"))),
         "粉丝数": as_int(first_present(user, ("follower_count", "followerCount"))),
@@ -719,15 +801,70 @@ def run_mediacrawler(
         "\n".join(
             [
                 "from pathlib import Path",
-                "import asyncio, json, runpy, sys",
+                "import asyncio, ctypes, json, os, runpy, subprocess, sys, time",
+                f"INTERACTIVE_LOGIN_EXIT_CODE = {INTERACTIVE_LOGIN_EXIT_CODE}",
+                f"interactive_login = os.environ.get({INTERACTIVE_LOGIN_ENV!r}) == '1'",
+                "def _visible_blank_chrome_windows():",
+                "    if os.name != 'nt':",
+                "        return set()",
+                "    handles = set()",
+                "    callback_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)",
+                "    user32 = ctypes.windll.user32",
+                "    def _visit(hwnd, _lparam):",
+                "        if user32.IsWindowVisible(hwnd):",
+                "            length = user32.GetWindowTextLengthW(hwnd)",
+                "            if length:",
+                "                title = ctypes.create_unicode_buffer(length + 1)",
+                "                user32.GetWindowTextW(hwnd, title, length + 1)",
+                "                if title.value == '\u65b0\u6807\u7b7e\u9875 - Google Chrome':",
+                "                    handles.add(int(hwnd))",
+                "        return True",
+                "    user32.EnumWindows(callback_type(_visit), 0)",
+                "    return handles",
+                "def _close_new_blank_chrome_windows(existing):",
+                "    if os.name != 'nt':",
+                "        return 0",
+                "    user32 = ctypes.windll.user32",
+                "    closed = set()",
+                "    for _attempt in range(20):",
+                "        for hwnd in _visible_blank_chrome_windows() - existing - closed:",
+                "            user32.ShowWindow(hwnd, 0)",
+                "            user32.PostMessageW(hwnd, 0x0010, 0, 0)",
+                "            closed.add(hwnd)",
+                "        time.sleep(0.1)",
+                "    if closed:",
+                "        print(f'[collector] closed {len(closed)} startup blank Chrome window(s)')",
+                "    return len(closed)",
+                "_original_popen = subprocess.Popen",
+                "def _popen_without_startup_window(command, *args, **kwargs):",
+                "    if isinstance(command, (list, tuple)) and any(str(part).startswith('--remote-debugging-port=') for part in command):",
+                "        command = list(command)",
+                "        if '--no-startup-window' not in command:",
+                "            command.append('--no-startup-window')",
+                "        existing_blank_windows = _visible_blank_chrome_windows() if not interactive_login else set()",
+                "        if os.name == 'nt' and not interactive_login:",
+                "            kwargs['creationflags'] = int(kwargs.get('creationflags', 0)) | subprocess.CREATE_NO_WINDOW",
+                "            startupinfo = kwargs.get('startupinfo') or subprocess.STARTUPINFO()",
+                "            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW",
+                "            startupinfo.wShowWindow = 0",
+                "            kwargs['startupinfo'] = startupinfo",
+                "        print('[collector] chrome launch flags headless=' + str('--headless=new' in command).lower() + ' no_startup=' + str('--no-startup-window' in command).lower())",
+                "        process = _original_popen(command, *args, **kwargs)",
+                "        if not interactive_login:",
+                "            _close_new_blank_chrome_windows(existing_blank_windows)",
+                "        return process",
+                "    return _original_popen(command, *args, **kwargs)",
+                "subprocess.Popen = _popen_without_startup_window",
                 f"media_dir = Path({str(media_dir)!r})",
                 "sys.path.insert(0, str(media_dir))",
                 "import config",
                 "config.ENABLE_CDP_MODE = True",
                 "config.CDP_CONNECT_EXISTING = False",
+                "config.HEADLESS = not interactive_login",
+                "config.CDP_HEADLESS = not interactive_login",
                 f"config.CDP_DEBUG_PORT = {cdp_port}",
                 f"config.USER_DATA_DIR = {f'{browser_profile_key}_%s_user_data_dir'!r}",
-                f"print('[collector] isolated browser profile={browser_profile_key} cdp_port_start={cdp_port}')",
+                f"print('[collector] isolated browser profile={browser_profile_key} cdp_port_start={cdp_port} visible=' + str(interactive_login).lower())",
                 "from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError",
                 "_original_page_goto = Page.goto",
                 "async def _page_goto_with_retry(self, url, **kwargs):",
@@ -743,6 +880,14 @@ def run_mediacrawler(
                 "Page.goto = _page_goto_with_retry",
                 "from media_platform.douyin.core import DouYinCrawler",
                 "from media_platform.douyin.client import DouYinClient",
+                "from media_platform.douyin.login import DouYinLogin",
+                "_original_login_begin = DouYinLogin.begin",
+                "async def _require_visible_browser_for_login(self):",
+                "    if not interactive_login:",
+                "        print('[collector] login required; reopening this browser visibly')",
+                "        raise SystemExit(INTERACTIVE_LOGIN_EXIT_CODE)",
+                "    return await _original_login_begin(self)",
+                "DouYinLogin.begin = _require_visible_browser_for_login",
                 "_original_create_douyin_client = DouYinCrawler.create_douyin_client",
                 "async def _create_douyin_client_with_navigation_retry(self, httpx_proxy):",
                 "    for attempt in range(3):",
@@ -846,14 +991,32 @@ def run_mediacrawler(
                 "    '--save_data_option', " + repr(args.save_data_option) + ",",
                 "    '--save_data_path', " + repr(str(output_dir)) + ",",
                 "    '--get_comment', 'false',",
+                "    '--headless', 'false' if interactive_login else 'true',",
                 "]",
                 "runpy.run_path(str(media_dir / 'main.py'), run_name='__main__')",
             ]
         ),
         encoding="utf-8",
     )
-    command = [resolve_media_crawler_python(media_dir, args.media_crawler_python), str(bootstrap)]
-    result = subprocess.run(command, cwd=media_dir, text=True, encoding="utf-8", errors="replace")
+    command = build_mediacrawler_command(media_dir, args.media_crawler_python, bootstrap)
+    run_env = os.environ.copy()
+    run_env.pop(INTERACTIVE_LOGIN_ENV, None)
+    try:
+        result = subprocess.run(
+            command, cwd=media_dir, env=run_env, text=True, encoding="utf-8", errors="replace",
+        )
+        if result.returncode == INTERACTIVE_LOGIN_EXIT_CODE:
+            cleanup_mediacrawler_chrome(browser_profile_key, cdp_port)
+            print(
+                f"[collector] Douyin login is required for profile={browser_profile_key}; "
+                "opening one visible browser for manual login"
+            )
+            run_env[INTERACTIVE_LOGIN_ENV] = "1"
+            result = subprocess.run(
+                command, cwd=media_dir, env=run_env, text=True, encoding="utf-8", errors="replace",
+            )
+    finally:
+        cleanup_mediacrawler_chrome(browser_profile_key, cdp_port)
     if result.returncode != 0:
         raise SystemExit(result.returncode)
     report = read_existing_payload(report_file) if report_file.exists() else {

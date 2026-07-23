@@ -290,11 +290,23 @@ def _nickname_from_title(title: str) -> str:
 
 
 def _nickname_from_text(text: str) -> str:
-    """Fallback: the token on the line just before '关注'."""
-    m = re.search(r"([^\n]{1,40})\n\s*关注", text)
+    """Fallback: the account name is the line just BEFORE the stats block
+    「关注 粉丝 获赞」. We must NOT match the top navigation bar, whose 「关注」
+    tab is followed by other tabs (朋友/我的/直播…), not by 粉丝/获赞."""
+    NAV = ("精选", "推荐", "关注", "朋友", "我的", "直播", "放映厅", "短剧",
+           "小游戏", "搜索", "客户端", "壁纸", "通知", "投稿", "充钻石",
+           "AI抖音", "抖音", "抖音极速版")
+    # 统计块：关注 … 粉丝 … 获赞（可能跨行）
+    m = re.search(r"([^\n]{1,40})\n\s*关注[\s\S]{0,40}?粉丝[\s\S]{0,40}?获赞", text)
     if m:
         cand = m.group(1).strip()
-        if cand and cand not in ("精选", "推荐", "关注", "朋友", "我的", "直播"):
+        if cand and cand not in NAV:
+            return cand
+    # 兜底：单独的「关注」行，且后接导航标签（非统计块）——仍取前一行，但排除导航词
+    m2 = re.search(r"([^\n]{1,40})\n\s*关注\s*\n\s*(朋友|我的|直播|放映厅|推荐|精选)", text)
+    if m2:
+        cand = m2.group(1).strip()
+        if cand and cand not in NAV:
             return cand
     return ""
 
