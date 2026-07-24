@@ -56,7 +56,7 @@ class DashboardSnapshot(NamedTuple):
     total_works: int
     pending_works: int
     account_profiles_total: int
-    account_profiles_ready: int
+    account_profiles_detected: int
     latest_log: Path | None
     log_tail: str
     refreshed_at: datetime
@@ -268,19 +268,18 @@ def account_profile_status(project_dir: Path, config: dict[str, Any]) -> tuple[i
     for value in collection.get("account_profiles", []):
         if isinstance(value, str) and value.strip() and value not in profiles:
             profiles.append(value.strip())
-    if not profiles:
-        for creator in config.get("creators", []):
-            if not isinstance(creator, dict):
-                continue
-            for value in creator.get("account_profiles", []):
-                if isinstance(value, str) and value.strip() and value not in profiles:
-                    profiles.append(value.strip())
+    for creator in config.get("creators", []):
+        if not isinstance(creator, dict):
+            continue
+        for value in creator.get("account_profiles", []):
+            if isinstance(value, str) and value.strip() and value not in profiles:
+                profiles.append(value.strip())
     media_crawler_dir = project_path(
         project_dir,
         collection.get("media_crawler_dir"),
         project_dir / "MediaCrawler",
     )
-    ready = 0
+    detected = 0
     for profile in profiles:
         cookie_file = (
             media_crawler_dir
@@ -292,10 +291,10 @@ def account_profile_status(project_dir: Path, config: dict[str, Any]) -> tuple[i
         )
         try:
             if cookie_file.stat().st_size > VALID_LOGIN_MIN_BYTES:
-                ready += 1
+                detected += 1
         except OSError:
             continue
-    return len(profiles), ready
+    return len(profiles), detected
 
 
 def read_log_tail(path: Path | None, lines: int = 100) -> str:
@@ -326,7 +325,7 @@ def build_dashboard_snapshot(
     log_dir = project_path(project_dir, config.get("log_dir"), project_dir / "logs")
     latest_run, run_payload = load_run_info(state_dir)
     creators = creator_statuses(project_dir, config, run_payload)
-    profiles_total, profiles_ready = account_profile_status(project_dir, config)
+    profiles_total, profiles_detected = account_profile_status(project_dir, config)
     latest_log = latest_file(log_dir, "pipeline-*.log")
     return DashboardSnapshot(
         task=task_provider(TASK_NAME),
@@ -336,7 +335,7 @@ def build_dashboard_snapshot(
         total_works=sum(item.works_count for item in creators),
         pending_works=sum(item.pending_count for item in creators),
         account_profiles_total=profiles_total,
-        account_profiles_ready=profiles_ready,
+        account_profiles_detected=profiles_detected,
         latest_log=latest_log,
         log_tail=read_log_tail(latest_log),
         refreshed_at=datetime.now().astimezone(),
@@ -728,7 +727,7 @@ class DashboardApp:
             try:
                 snapshot = build_dashboard_snapshot(PROJECT_DIR)
             except Exception as exc:
-                self.root.after(0, lambda: self._refresh_failed(exc))
+                self.root.after(0, lambda exc=exc: self._refresh_failed(exc))
             else:
                 self.root.after(0, lambda: self._apply_snapshot(snapshot))
 
@@ -770,16 +769,16 @@ class DashboardApp:
             f"待处理 {snapshot.pending_works} 条",
         )
         account_value = (
-            f"{snapshot.account_profiles_ready}/{snapshot.account_profiles_total} 可用"
+            f"{snapshot.account_profiles_detected}/{snapshot.account_profiles_total} 已检测"
             if snapshot.account_profiles_total
             else "未启用"
         )
         self.account_card.set(
             account_value,
-            "独立登录 profile",
+            "本地登录文件（非在线校验）",
             COLORS["success"]
             if snapshot.account_profiles_total
-            and snapshot.account_profiles_ready == snapshot.account_profiles_total
+            and snapshot.account_profiles_detected == snapshot.account_profiles_total
             else COLORS["warning"],
         )
 
@@ -839,7 +838,7 @@ class DashboardApp:
             try:
                 message = start_scheduled_task()
             except Exception as exc:
-                self.root.after(0, lambda: self._run_failed(exc))
+                self.root.after(0, lambda exc=exc: self._run_failed(exc))
             else:
                 self.root.after(0, lambda: self._run_started(message))
 

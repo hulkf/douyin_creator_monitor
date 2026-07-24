@@ -51,6 +51,7 @@ class DashboardDataTest(unittest.TestCase):
                         "key": "a",
                         "creator_name": "达人 A",
                         "works_file": str(works_a),
+                        "account_profiles": ["account-c"],
                     },
                     {
                         "key": "b",
@@ -63,7 +64,11 @@ class DashboardDataTest(unittest.TestCase):
                 json.dumps(config, ensure_ascii=False),
                 encoding="utf-8",
             )
-            for profile, size in (("account-a", 40_000), ("account-b", 1_000)):
+            for profile, size in (
+                ("account-a", 40_000),
+                ("account-b", 1_000),
+                ("account-c", 40_000),
+            ):
                 cookie_file = (
                     media_crawler
                     / "browser_data"
@@ -116,8 +121,8 @@ class DashboardDataTest(unittest.TestCase):
             self.assertEqual(snapshot.pending_works, 1)
             self.assertEqual(snapshot.latest_run.status, "partial_failure")
             self.assertEqual(snapshot.latest_run.wall_seconds, 150.0)
-            self.assertEqual(snapshot.account_profiles_total, 2)
-            self.assertEqual(snapshot.account_profiles_ready, 1)
+            self.assertEqual(snapshot.account_profiles_total, 3)
+            self.assertEqual(snapshot.account_profiles_detected, 2)
             self.assertEqual(snapshot.latest_log, log_file)
             self.assertEqual(snapshot.creators[0].status, "success")
             self.assertEqual(snapshot.creators[0].works_count, 2)
