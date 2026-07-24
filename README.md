@@ -252,7 +252,32 @@ D:\JR_project\douyin_creator_monitor
 
 建议先手动运行单条作品并确认飞书、IMA、夸克和 Obsidian 均正确，再接入每日调度。
 
-## 本地 GUI 监控面板
+## 本地 Web 管理页面
+
+双击仓库根目录的：
+
+~~~text
+run_web.bat
+~~~
+
+浏览器会自动打开 `http://127.0.0.1:8765/`。Web 服务只监听本机地址，使用 Python 标准库，不需要安装 Node.js、前端框架或额外 Python 依赖。关闭启动 Web 服务的终端窗口即可停止页面服务，不会停止已经由 Windows 任务计划程序启动的流水线。
+
+Web 页面提供：
+
+- Windows 定时任务、最近运行、达人作品、待处理数、账号池和日志总览；
+- “立即运行”只调用 `schtasks /run /tn DouyinCreatorMonitor`，不会从 Web 服务直接运行 Python 流水线；
+- 可视化编辑 `local/pipeline.json` 的基础目录、MediaCrawler、增量采集、账号池、飞书字段、ASR、内容总结、三处备份和达人配置；
+- 保存前校验数字范围、开关类型和达人 key 唯一性；
+- 同目录原子保存，并把上一个版本保留为 `local/pipeline.backup.json`；
+- 未在表单中展示的扩展字段会原样保留；真实 Token、API Key、Cookie 和登录态仍只放在环境变量或 `local/` 私有文件中。
+
+也可以从终端自定义端口启动：
+
+~~~powershell
+python .\scripts\web_dashboard.py --port 8765
+~~~
+
+## 本地 GUI 监控面板（保留）
 
 双击仓库根目录的：
 

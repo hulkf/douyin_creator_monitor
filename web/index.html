@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <title>抖音达人监控中心</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true"><span></span></div>
+          <div>
+            <strong>Creator Flow</strong>
+            <small>抖音达人监控</small>
+          </div>
+        </div>
+
+        <nav class="nav" aria-label="主导航">
+          <button class="nav-item active" type="button" data-tab-target="overview">
+            <span class="nav-icon">⌁</span><span>运行总览</span>
+          </button>
+          <button class="nav-item" type="button" data-tab-target="config">
+            <span class="nav-icon">⌘</span><span>项目配置</span>
+          </button>
+        </nav>
+
+        <div class="sidebar-note">
+          <span class="pulse-dot"></span>
+          <div>
+            <strong>仅本机访问</strong>
+            <small>配置保存在 local/pipeline.json</small>
+          </div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">DOUYIN CREATOR MONITOR</p>
+            <h1 id="page-title">运行总览</h1>
+          </div>
+          <div class="top-actions">
+            <div class="task-pill" id="task-pill">
+              <span class="status-dot"></span>
+              <span id="task-pill-text">正在读取任务状态</span>
+            </div>
+            <button class="button secondary" id="refresh-button" type="button">刷新</button>
+            <button class="button primary" id="run-button" type="button">
+              <span>▶</span> 立即运行
+            </button>
+          </div>
+        </header>
+
+        <section class="tab-page active" id="tab-overview">
+          <div class="notice hidden" id="status-error" role="alert"></div>
+
+          <div class="metric-grid">
+            <article class="metric-card coral">
+              <div class="metric-icon">⌁</div>
+              <div class="metric-label">定时任务</div>
+              <div class="metric-value" id="metric-task">—</div>
+              <div class="metric-note" id="metric-task-note">正在读取</div>
+            </article>
+            <article class="metric-card blue">
+              <div class="metric-icon">↗</div>
+              <div class="metric-label">最近运行</div>
+              <div class="metric-value" id="metric-run">—</div>
+              <div class="metric-note" id="metric-run-note">暂无数据</div>
+            </article>
+            <article class="metric-card violet">
+              <div class="metric-icon">◎</div>
+              <div class="metric-label">达人 / 作品</div>
+              <div class="metric-value" id="metric-creators">—</div>
+              <div class="metric-note" id="metric-creators-note">待处理 — 条</div>
+            </article>
+            <article class="metric-card green">
+              <div class="metric-icon">◫</div>
+              <div class="metric-label">账号池</div>
+              <div class="metric-value" id="metric-accounts">—</div>
+              <div class="metric-note">本地登录文件检测</div>
+            </article>
+          </div>
+
+          <div class="overview-grid">
+            <section class="panel creators-panel">
+              <div class="panel-header">
+                <div>
+                  <p class="panel-kicker">CREATORS</p>
+                  <h2>达人运行状态</h2>
+                </div>
+                <span class="panel-meta" id="creator-summary">—</span>
+              </div>
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>达人</th>
+                      <th>作品</th>
+                      <th>待处理</th>
+                      <th>更新时间</th>
+                      <th>状态</th>
+                      <th>说明</th>
+                    </tr>
+                  </thead>
+                  <tbody id="creator-table-body">
+                    <tr><td colspan="6" class="empty-cell">正在读取达人数据…</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </section>
+
+            <section class="panel schedule-panel">
+              <div class="panel-header compact">
+                <div>
+                  <p class="panel-kicker">SCHEDULE</p>
+                  <h2>任务计划</h2>
+                </div>
+              </div>
+              <div class="schedule-list">
+                <div><span>上次运行</span><strong id="schedule-last">—</strong></div>
+                <div><span>下次运行</span><strong id="schedule-next">—</strong></div>
+                <div><span>最近退出码</span><strong id="schedule-code">—</strong></div>
+                <div><span>本轮耗时</span><strong id="schedule-duration">—</strong></div>
+              </div>
+              <div class="schedule-hint">
+                <span>i</span>
+                页面只通过 Windows 任务计划程序点燃正式流水线。
+              </div>
+            </section>
+          </div>
+
+          <section class="panel log-panel">
+            <div class="panel-header compact">
+              <div>
+                <p class="panel-kicker">LATEST LOG</p>
+                <h2>最新流水线日志</h2>
+              </div>
+              <span class="panel-meta mono" id="log-name">暂无日志</span>
+            </div>
+            <pre id="log-output">正在读取日志…</pre>
+          </section>
+        </section>
+
+        <section class="tab-page" id="tab-config">
+          <div class="config-toolbar">
+            <div>
+              <p id="config-path">local/pipeline.json</p>
+              <span>敏感凭据仍由环境变量或 local 私有文件维护，不会显示在这里。</span>
+            </div>
+            <div class="toolbar-actions">
+              <span class="unsaved hidden" id="unsaved-badge">有未保存更改</span>
+              <button class="button secondary" id="reload-config-button" type="button">放弃更改</button>
+              <button class="button primary" id="save-config-button" type="button">保存配置</button>
+            </div>
+          </div>
+          <div class="notice hidden" id="config-notice" role="status"></div>
+          <form id="config-form" autocomplete="off">
+            <div class="config-loading">正在加载配置…</div>
+          </form>
+        </section>
+      </main>
+    </div>
+
+    <div class="toast-stack" id="toast-stack" aria-live="polite"></div>
+    <script src="/app.js"></script>
+  </body>
+</html>
