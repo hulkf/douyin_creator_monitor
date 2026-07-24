@@ -9,6 +9,7 @@
     "incremental_probe_count": 3,
     "cdp_port_start": 9222,
     "cdp_port_stride": 10,
+    "account_profiles": [],
     "media_crawler_dir": "D:/path/to/MediaCrawler",
     "media_crawler_python": "D:/path/to/MediaCrawler/.venv/Scripts/python.exe",
     "max_count": 200,

@@ -560,23 +560,66 @@ def _find_fallback_profile_key(browser_data: Path, exclude_key: str) -> str | No
     return None
 
 
+def account_profile_keys(config: dict[str, Any], creator: dict[str, Any]) -> list[str]:
+    """Return the explicitly configured Douyin account profile pool."""
+
+    defaults = section(config, "collection")
+    raw = creator.get("account_profiles")
+    creator_specific = raw not in (None, "")
+    if raw in (None, ""):
+        raw = defaults.get("account_profiles")
+    if raw in (None, ""):
+        return []
+    if not isinstance(raw, list):
+        raise PipelineError("collection.account_profiles 必须是 profile key 字符串数组。")
+    result: list[str] = []
+    for value in raw:
+        if not isinstance(value, str) or not value.strip():
+            raise PipelineError("collection.account_profiles 只能包含非空 profile key 字符串。")
+        key = safe_key(value)
+        if key not in result:
+            result.append(key)
+    if result and not creator_specific:
+        offset = collection_slot(config, creator) % len(result)
+        result = result[offset:] + result[:offset]
+    return result
+
+
+def account_blocked_error(exc: BaseException | str) -> bool:
+    """Only rotate accounts for MediaCrawler's explicit account-block signal."""
+
+    return "account blocked" in str(exc).lower()
+
+
+def runtime_blocked_account_profiles(config: dict[str, Any]) -> set[str]:
+    blocked = config.get("_runtime_blocked_account_profiles")
+    if not isinstance(blocked, set):
+        blocked = set()
+        config["_runtime_blocked_account_profiles"] = blocked
+    return blocked
+
+
 def collect_command(
     config: dict[str, Any], creator: dict[str, Any], works_file: Path,
     media_output: Path, collection_state_file: Path, normalize_only: bool,
     force_full_collect: bool = False,
     profile_output_file: Path | None = None,
+    browser_profile_key: str | None = None,
 ) -> list[str]:
     defaults = section(config, "collection")
     creator_url = str(creator.get("creator_url") or "").strip()
     if not creator_url:
         raise PipelineError(f"达人 {creator_key(creator)} 缺少 creator_url。")
-    profile_key = str(chosen(creator, defaults, "browser_profile_key", creator_key(creator)))
+    explicit_profile = browser_profile_key is not None
+    profile_key = safe_key(
+        str(browser_profile_key or chosen(creator, defaults, "browser_profile_key", creator_key(creator)))
+    )
     # 登录态复用：自身目录没有效登录（空壳/缺失）时，自动改用
     # 任意一个有有效登录态的已有目录，避免无人值守卡在扫码登录。
     media_dir = Path(str(chosen(creator, defaults, "media_crawler_dir") or "")).expanduser()
     browser_data = (media_dir / "browser_data") if media_dir else (PROJECT_DIR / "browser_data")
     own_udir = _user_data_dir_for_key(browser_data, profile_key)
-    if not _has_valid_login(own_udir):
+    if not explicit_profile and not _has_valid_login(own_udir):
         fb = _find_fallback_profile_key(browser_data, profile_key)
         if fb:
             print(
@@ -1790,22 +1833,107 @@ def collect_creator_phase(
     if args.skip_collect:
         logger.write(f"跳过采集 {name}")
     else:
-        try:
-            runner.run(
-                f"采集 {name}",
-                collect_command(
-                    config, creator, works_file, media_output, collection_state_file,
-                    args.normalize_only, args.force_full_collect,
-                    profile_output_file=profile_file,
-                ),
-                env,
+        profile_pool = [] if args.normalize_only else account_profile_keys(config, creator)
+        if profile_pool:
+            defaults = section(config, "collection")
+            media_crawler_dir = Path(
+                str(chosen(creator, defaults, "media_crawler_dir") or "")
+            ).expanduser()
+            browser_data = (
+                media_crawler_dir / "browser_data"
+                if str(media_crawler_dir) not in ("", ".")
+                else PROJECT_DIR / "browser_data"
             )
-        except Exception as exc:
+            blocked_profiles = runtime_blocked_account_profiles(config)
+            pool_attempts: list[dict[str, str]] = []
+            last_error: Exception | None = None
+            exhausted_by_block = True
             collection_ok = False
-            result["collection_error"] = str(exc)
-            logger.write(f"采集失败 {name}: {exc}")
-            if args.fail_fast:
-                raise
+            for profile_key in profile_pool:
+                if profile_key in blocked_profiles:
+                    pool_attempts.append({
+                        "profile_key": profile_key,
+                        "status": "skipped_blocked",
+                    })
+                    continue
+                if not args.dry_run and not _has_valid_login(
+                    _user_data_dir_for_key(browser_data, profile_key)
+                ):
+                    pool_attempts.append({
+                        "profile_key": profile_key,
+                        "status": "missing_login",
+                    })
+                    continue
+                try:
+                    runner.run(
+                        f"采集 {name} [账号槽位 {profile_key}]",
+                        collect_command(
+                            config, creator, works_file, media_output,
+                            collection_state_file, args.normalize_only,
+                            args.force_full_collect,
+                            profile_output_file=profile_file,
+                            browser_profile_key=profile_key,
+                        ),
+                        env,
+                    )
+                except Exception as exc:
+                    last_error = exc
+                    if account_blocked_error(exc):
+                        blocked_profiles.add(profile_key)
+                        pool_attempts.append({
+                            "profile_key": profile_key,
+                            "status": "blocked",
+                        })
+                        logger.write(
+                            f"账号槽位封控 {profile_key}，本轮熔断并尝试下一个登录态"
+                        )
+                        continue
+                    exhausted_by_block = False
+                    pool_attempts.append({
+                        "profile_key": profile_key,
+                        "status": "failed",
+                    })
+                    break
+                else:
+                    collection_ok = True
+                    exhausted_by_block = False
+                    pool_attempts.append({
+                        "profile_key": profile_key,
+                        "status": "success",
+                    })
+                    result["account_profile_key"] = profile_key
+                    break
+            result["account_pool_attempts"] = pool_attempts
+            if not collection_ok:
+                if last_error is not None:
+                    result["collection_error"] = str(last_error)
+                elif pool_attempts:
+                    result["collection_error"] = (
+                        "账号池没有可用登录态；请检查 profile 是否已登录或是否已在本轮封控。"
+                    )
+                else:
+                    result["collection_error"] = "账号池为空。"
+                result["account_pool_exhausted"] = exhausted_by_block
+                logger.write(f"采集失败 {name}: {result['collection_error']}")
+                if args.fail_fast:
+                    raise PipelineError(result["collection_error"])
+        else:
+            try:
+                runner.run(
+                    f"采集 {name}",
+                    collect_command(
+                        config, creator, works_file, media_output, collection_state_file,
+                        args.normalize_only, args.force_full_collect,
+                        profile_output_file=profile_file,
+                    ),
+                    env,
+                )
+            except Exception as exc:
+                collection_ok = False
+                result["collection_error"] = str(exc)
+                logger.write(f"采集失败 {name}: {exc}")
+                if args.fail_fast:
+                    raise
 
     if collection_ok and not args.skip_collect and not args.normalize_only:
         if args.skip_feishu_sync:
@@ -1868,7 +1996,10 @@ def collect_creator_phase(
         result["phase_timings"]["collection_and_sync_seconds"] = round(
             time.perf_counter() - phase_started, 3,
         )
-        return {"creator": creator, "result": result, "terminal": True, "name": name}
+        return {
+            "creator": creator, "result": result, "terminal": True, "name": name,
+            "collection_ok": collection_ok, "sync_ok": sync_ok,
+        }
 
     if not args.dry_run:
         for work in selected:
@@ -2473,6 +2604,16 @@ def main(argv: list[str] | None = None) -> int:
             collect_workers = int(args.collect_workers)
             if collect_workers < 1:
                 raise PipelineError("--collect-workers 必须至少为 1。")
+            account_pool_enabled = any(
+                account_profile_keys(config, creator) for creator in creators
+            )
+            if account_pool_enabled:
+                config["_runtime_blocked_account_profiles"] = set()
+                if collect_workers != 1:
+                    logger.write(
+                        "账号池已启用：首版使用串行达人采集，避免多个任务同时占用同一登录 profile。"
+                    )
+                collect_workers = 1
 
             # Creator collection is a bounded parallel producer. Successful creators
             # enter the single-consumer transcript queue immediately. Only creators
@@ -2507,11 +2648,33 @@ def main(argv: list[str] | None = None) -> int:
                             continue
                         context_error = collection_context_error(context)
                         if context_error is not None:
+                            result = context.get("result")
+                            if (
+                                isinstance(result, dict)
+                                and result.get("account_pool_exhausted") is True
+                            ):
+                                result["collection_attempts"] = len([
+                                    item for item in result.get("account_pool_attempts", [])
+                                    if item.get("status") in {"blocked", "failed", "success"}
+                                ])
+                                result["fallback_to_serial"] = False
+                                result.setdefault("phase_timings", {})[
+                                    "parallel_collection_seconds"
+                                ] = round(attempt_seconds, 3)
+                                collection_results[key] = result
+                                logger.write(
+                                    f"达人账号池已耗尽 {key}: {context_error}"
+                                )
+                                continue
                             collection_failures[key] = (PipelineError(context_error), attempt_seconds)
                             logger.write(f"达人并发采集失败 {key}: {context_error}")
                             continue
                         result = context["result"]
-                        result["collection_attempts"] = 1
+                        pool_attempt_count = len([
+                            item for item in result.get("account_pool_attempts", [])
+                            if item.get("status") in {"blocked", "failed", "success"}
+                        ])
+                        result["collection_attempts"] = pool_attempt_count or 1
                         result["fallback_to_serial"] = False
                         result.setdefault("phase_timings", {})["parallel_collection_seconds"] = round(
                             attempt_seconds, 3,

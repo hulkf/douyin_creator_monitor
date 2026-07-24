@@ -299,3 +299,33 @@ python .\scripts\run_creator_pipeline.py --creator aligc --feishu-only
 - 运行摘要记录 `collection_attempts`、`fallback_to_serial`、`parallel_collection_seconds` 和可选的 `serial_retry_seconds`。
 - `run_daily.bat` 分别记录新增达人接入、主流水线、主页采集回写三个退出码；任一阶段失败，Windows 计划任务最终退出码均为非零。
 - 2026-07-20 真实三达人并发验证 `run_id=20260720-121425`：首轮 3/3 成功，均为 `collection_attempts=1`、`fallback_to_serial=false`；墙钟耗时 `105.795` 秒，相比隔离前基准 `725.965` 秒减少约 `85.43%`。本轮没有新增作品，因此未触发 ASR 和交付阶段。
+
+## 抖音登录账号池与封控轮换
+
+MediaCrawler 原生只支持单个 `COOKIES` 或单个持久化 `USER_DATA_DIR`，没有内置账号池。本项目可在适配层配置多个已经分别扫码登录的 Chrome profile：
+
+~~~json
+{
+  "collection": {
+    "account_profiles": [
+      "douyin-account-1",
+      "douyin-account-2"
+    ]
+  }
+}
+~~~
+
+对应的登录态目录为：
+
+~~~text
+<MediaCrawler>/browser_data/cdp_douyin-account-1_dy_user_data_dir
+<MediaCrawler>/browser_data/cdp_douyin-account-2_dy_user_data_dir
+~~~
+
+- 每个 profile 必须由不同抖音账号单独扫码登录；配置只保存 profile key，不保存或复制 Cookie。
+- 全局账号池会按达人顺序轮换起始账号，分散单账号请求量。也可在单个达人配置中用 `account_profiles` 覆盖全局顺序。
+- 只有 MediaCrawler 明确返回 `account blocked` 时才切换账号；普通网络超时或代码错误继续按原有串行补采规则处理。
+- 某个 profile 一旦在本轮返回 `account blocked`，本轮后续达人会跳过它，避免重复撞风控。
+- 账号池启用后，当前版本自动把达人采集降为串行，避免两个采集任务同时占用同一个 Chrome profile。未配置账号池时，原有达人并发采集行为不变。
+- 所有账号都不可用时，本轮报告 `partial_failure`，并保留本地与飞书已有作品；不会用空值覆盖，也不会删除历史记录。
+- `account_pool_attempts`、最终成功的 `account_profile_key` 和 `account_pool_exhausted` 会写入本轮运行摘要，便于判断哪个账号需要重新登录或冷却。
