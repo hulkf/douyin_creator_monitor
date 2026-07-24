@@ -17,6 +17,29 @@ assert SPEC and SPEC.loader
 SPEC.loader.exec_module(WEB)
 
 
+def valid_creator(key="creator-a"):
+    return {
+        "key": key,
+        "enabled": True,
+        "creator_url": f"https://www.douyin.com/user/{key}",
+        "creator_name": f"达人 {key}",
+        "creator_dir_name": key,
+        "works_table_id": f"table-{key}",
+        "works_file": f"runtime/{key}-works.json",
+    }
+
+
+def valid_config(*, creators=None, max_works=0):
+    return {
+        "max_works": max_works,
+        "feishu": {
+            "creator_table_id": "creator-table",
+            "work_id_field": "抖音作品ID",
+        },
+        "creators": list(creators or []),
+    }
+
+
 class WebDashboardConfigTests(unittest.TestCase):
     def test_load_config_merges_template_defaults_without_replacing_creators(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -48,18 +71,31 @@ class WebDashboardConfigTests(unittest.TestCase):
             self.assertEqual(loaded.config["creators"], local["creators"])
 
     def test_validate_config_reports_duplicate_creator_keys_and_bad_workers(self):
-        config = {
+        config = valid_config(creators=[valid_creator("same"), valid_creator("same")])
+        config.update({
             "collection": {"profile_max_workers": 0},
-            "creators": [
-                {"key": "same", "enabled": True},
-                {"key": "same", "enabled": False},
-            ],
-        }
+        })
 
         errors = WEB.validate_pipeline_config(config)
 
         self.assertTrue(any("profile_max_workers" in error for error in errors))
         self.assertTrue(any("重复" in error for error in errors))
+
+    def test_validate_config_enforces_data_protection_and_required_creator_fields(self):
+        config = valid_config(creators=[valid_creator()])
+        config["feishu"]["work_id_field"] = "标题"
+        config["creators"][0]["works_table_id"] = ""
+
+        errors = WEB.validate_pipeline_config(config)
+
+        self.assertTrue(any("必须是 抖音作品ID" in error for error in errors))
+        self.assertTrue(any("works_table_id" in error for error in errors))
+
+    def test_validate_config_allows_fractional_profile_cache_hours(self):
+        config = valid_config()
+        config["collection"] = {"profile_ttl_hours": 0.5}
+
+        self.assertEqual(WEB.validate_pipeline_config(config), [])
 
     def test_save_config_is_atomic_and_keeps_one_recoverable_backup(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -69,7 +105,7 @@ class WebDashboardConfigTests(unittest.TestCase):
             path.write_text('{"version": 1}', encoding="utf-8")
 
             result = WEB.save_pipeline_config(
-                {"version": 2, "creators": [{"key": "creator-a"}]}, root
+                {"version": 2, **valid_config(creators=[valid_creator()])}, root
             )
 
             self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["version"], 2)
@@ -114,10 +150,10 @@ class WebDashboardHttpTests(unittest.TestCase):
         (self.root / "local").mkdir()
         (self.root / "web").mkdir()
         (self.root / "config" / "pipeline.example.json").write_text(
-            json.dumps({"max_works": 0, "creators": []}), encoding="utf-8"
+            json.dumps(valid_config()), encoding="utf-8"
         )
         (self.root / "local" / "pipeline.json").write_text(
-            json.dumps({"max_works": 3, "creators": []}), encoding="utf-8"
+            json.dumps(valid_config(max_works=3)), encoding="utf-8"
         )
         (self.root / "web" / "index.html").write_text("<h1>dashboard</h1>", encoding="utf-8")
         self.snapshot_builder = Mock(side_effect=RuntimeError("status unavailable in test"))
@@ -159,7 +195,7 @@ class WebDashboardHttpTests(unittest.TestCase):
         status, payload = self.request(
             "/api/config",
             method="PUT",
-            payload={"max_works": 8, "creators": [{"key": "new"}]},
+            payload=valid_config(max_works=8, creators=[valid_creator("new")]),
         )
         self.assertEqual(status, 200)
         self.assertEqual(payload["config"]["max_works"], 8)
@@ -180,7 +216,9 @@ class WebDashboardHttpTests(unittest.TestCase):
             self.request(
                 "/api/config",
                 method="PUT",
-                payload={"creators": [{"key": "duplicate"}, {"key": "duplicate"}]},
+                payload=valid_config(
+                    creators=[valid_creator("duplicate"), valid_creator("duplicate")]
+                ),
             )
 
         self.assertEqual(caught.exception.code, 400)

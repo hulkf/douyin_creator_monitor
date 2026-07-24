@@ -130,6 +130,7 @@ pre { margin: 0; min-height: 175px; max-height: 310px; overflow: auto; padding: 
 .field input, .field select, .field textarea { width: 100%; border: 1px solid #dedad4; border-radius: 8px; outline: none; background: #fdfcfb; color: var(--ink); padding: 9px 10px; font-size: 10px; transition: border .15s, box-shadow .15s; }
 .field textarea { min-height: 74px; resize: vertical; line-height: 1.5; }
 .field input:focus, .field select:focus, .field textarea:focus { border-color: #f08b81; box-shadow: 0 0 0 3px rgba(255,95,82,.09); }
+.field input[readonly] { color: #777a7e; background: #f1efeb; cursor: not-allowed; }
 .switch-field { display: flex; align-items: center; justify-content: space-between; padding: 10px 11px; border: 1px solid #e4e0da; border-radius: 9px; background: #fbfaf8; }
 .switch-field div { display: grid; gap: 3px; }
 .switch-field strong { font-size: 10px; }

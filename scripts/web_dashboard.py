@@ -141,6 +141,21 @@ def _check_boolean(source: dict[str, Any], key: str, label: str, errors: list[st
         errors.append(f"{label} 必须是开关值")
 
 
+def _check_required_text(
+    source: dict[str, Any],
+    key: str,
+    label: str,
+    errors: list[str],
+    *,
+    expected: str | None = None,
+) -> None:
+    value = source.get(key)
+    if not isinstance(value, str) or not value.strip():
+        errors.append(f"{label} 不能为空")
+    elif expected is not None and value.strip() != expected:
+        errors.append(f"{label} 必须是 {expected}")
+
+
 def validate_pipeline_config(config: Any) -> list[str]:
     if not isinstance(config, dict):
         return ["配置根节点必须是 JSON 对象"]
@@ -151,19 +166,42 @@ def validate_pipeline_config(config: Any) -> list[str]:
     collection = _require_object(config, "collection", errors)
     for key, minimum in (
         ("incremental_probe_count", 1),
-        ("cdp_port_start", 1),
         ("cdp_port_stride", 1),
         ("max_count", 1),
         ("expect_min_count", 0),
         ("profile_max_workers", 1),
-        ("profile_ttl_hours", 0),
     ):
         _check_integer(collection, key, f"collection.{key}", errors, minimum=minimum)
+    _check_integer(
+        collection,
+        "cdp_port_start",
+        "collection.cdp_port_start",
+        errors,
+        minimum=1,
+        maximum=65535,
+    )
+    _check_number(
+        collection,
+        "profile_ttl_hours",
+        "collection.profile_ttl_hours",
+        errors,
+        minimum=0,
+    )
     for key in ("incremental_enabled", "clean_media_output"):
         _check_boolean(collection, key, f"collection.{key}", errors)
     profiles = collection.get("account_profiles", [])
     if not isinstance(profiles, list) or any(not isinstance(item, str) for item in profiles):
         errors.append("collection.account_profiles 必须是字符串数组")
+
+    feishu = _require_object(config, "feishu", errors)
+    _check_required_text(feishu, "creator_table_id", "feishu.creator_table_id", errors)
+    _check_required_text(
+        feishu,
+        "work_id_field",
+        "feishu.work_id_field",
+        errors,
+        expected="抖音作品ID",
+    )
 
     asr = _require_object(config, "asr", errors)
     _check_integer(asr, "max_workers", "asr.max_workers", errors, minimum=1)
@@ -208,6 +246,19 @@ def validate_pipeline_config(config: Any) -> list[str]:
             errors.append(f"达人 key 重复：{key}")
         keys.add(key)
         _check_boolean(creator, "enabled", f"{prefix}.enabled", errors)
+        for required_key in (
+            "creator_url",
+            "creator_name",
+            "creator_dir_name",
+            "works_table_id",
+            "works_file",
+        ):
+            _check_required_text(
+                creator,
+                required_key,
+                f"{prefix}.{required_key}",
+                errors,
+            )
         creator_profiles = creator.get("account_profiles", [])
         if not isinstance(creator_profiles, list) or any(
             not isinstance(item, str) for item in creator_profiles
@@ -436,7 +487,6 @@ def make_handler(
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="抖音达人监控本地 Web 控制台")
-    parser.add_argument("--host", default="127.0.0.1", help="监听地址，默认仅本机可访问")
     parser.add_argument("--port", type=int, default=8765, help="监听端口")
     parser.add_argument("--no-browser", action="store_true", help="启动后不自动打开浏览器")
     return parser.parse_args(argv)
@@ -446,9 +496,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if not 1 <= args.port <= 65535:
         raise SystemExit("端口必须在 1 到 65535 之间")
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(PROJECT_DIR))
-    url_host = "127.0.0.1" if args.host in {"0.0.0.0", "::"} else args.host
-    url = f"http://{url_host}:{server.server_port}/"
+    server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(PROJECT_DIR))
+    url = f"http://127.0.0.1:{server.server_port}/"
     print(f"抖音达人监控 Web 控制台：{url}", flush=True)
     print("按 Ctrl+C 停止本地服务。", flush=True)
     if not args.no_browser:

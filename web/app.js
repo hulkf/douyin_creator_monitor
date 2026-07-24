@@ -269,6 +269,10 @@ function createField(definition, value, path, creatorKey = null) {
     if (type === "number") input.step = "any";
     wrapper.append(input);
   }
+  if (path === "feishu.work_id_field") {
+    input.readOnly = true;
+    input.title = "作品唯一键由项目数据保护规则固定";
+  }
   input.dataset.valueType = type;
   if (creatorKey !== null) input.dataset.creatorKey = fieldKey;
   else input.dataset.path = path;
@@ -328,8 +332,6 @@ function renderConfig() {
   });
   list.append(add); creatorsSection.append(creatorHead, list); grid.append(creatorsSection);
   form.append(grid);
-  form.addEventListener("input", markDirty);
-  form.addEventListener("change", markDirty);
 }
 
 function readInput(input) {
@@ -428,6 +430,8 @@ document.querySelectorAll("[data-tab-target]").forEach((button) => button.addEve
 el("refresh-button").addEventListener("click", () => loadStatus(true));
 el("run-button").addEventListener("click", runNow);
 el("save-config-button").addEventListener("click", saveConfig);
+el("config-form").addEventListener("input", markDirty);
+el("config-form").addEventListener("change", markDirty);
 el("reload-config-button").addEventListener("click", () => {
   if (state.dirty && !confirm("放弃尚未保存的配置更改？")) return;
   loadConfig(true);
