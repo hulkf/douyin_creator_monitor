@@ -1015,6 +1015,24 @@ class PipelineHelpersTest(unittest.TestCase):
         )
         self.assertIn("--force-full-collect", forced)
 
+    def test_collect_command_can_choose_a_visible_or_headless_browser(self):
+        creator = {"key": "demo", "creator_url": "creator-id"}
+        base = {"python": "python", "creators": [creator]}
+
+        visible = PIPELINE.collect_command(
+            {**base, "collection": {"headless": False}}, creator,
+            Path("works.json"), Path("media-output"), Path("state.json"), False,
+        )
+        headless = PIPELINE.collect_command(
+            {**base, "collection": {"headless": True}}, creator,
+            Path("works.json"), Path("media-output"), Path("state.json"), False,
+        )
+
+        self.assertIn("--visible-browser", visible)
+        self.assertNotIn("--headless", visible)
+        self.assertIn("--headless", headless)
+        self.assertNotIn("--visible-browser", headless)
+
     def test_account_pool_rotates_only_after_account_blocked(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

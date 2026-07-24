@@ -16,6 +16,7 @@
     "min_publish_date": "2025-01-01",
     "expect_min_count": 1,
     "login_type": "qrcode",
+    "headless": true,
     "save_data_option": "jsonl",
     "profile_max_workers": 3,
     "profile_ttl_hours": 12,

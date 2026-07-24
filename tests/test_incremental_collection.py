@@ -326,6 +326,7 @@ class IncrementalCollectionTest(unittest.TestCase):
                     browser_profile_key=f"creator-{key}",
                     cdp_port=9222 if key == "a" else 9232,
                     min_publish_date="2025-01-01",
+                    headless=False,
                 )
                 return COLLECTOR.run_mediacrawler(args, mode="incremental", known_ids=set())
 
@@ -354,9 +355,10 @@ class IncrementalCollectionTest(unittest.TestCase):
                 },
             )
             self.assertTrue(all("config.CDP_CONNECT_EXISTING = False" in text for text in bootstrap_texts))
-            self.assertTrue(all("config.HEADLESS = not interactive_login" in text for text in bootstrap_texts))
-            self.assertTrue(all("config.CDP_HEADLESS = not interactive_login" in text for text in bootstrap_texts))
-            self.assertTrue(all("'--headless', 'false' if interactive_login else 'true'" in text for text in bootstrap_texts))
+            self.assertTrue(all("requested_headless = False" in text for text in bootstrap_texts))
+            self.assertTrue(all("config.HEADLESS = requested_headless and not interactive_login" in text for text in bootstrap_texts))
+            self.assertTrue(all("config.CDP_HEADLESS = requested_headless and not interactive_login" in text for text in bootstrap_texts))
+            self.assertTrue(all("'--headless', 'true' if requested_headless and not interactive_login else 'false'" in text for text in bootstrap_texts))
             self.assertTrue(all("--no-startup-window" in text for text in bootstrap_texts))
             self.assertTrue(all("_close_new_blank_chrome_windows" in text for text in bootstrap_texts))
             self.assertTrue(all("subprocess.CREATE_NO_WINDOW" in text for text in bootstrap_texts))

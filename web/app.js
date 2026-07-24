@@ -7,6 +7,7 @@ const state = {
   activeConfigCategory: "general",
   activeCreatorIndex: 0,
   accountPool: { profiles: [] },
+  history: { stats: {}, runs: [] },
 };
 
 const sectionDefinitions = [
@@ -39,6 +40,7 @@ const sectionDefinitions = [
       ["collection.expect_min_count", "最少预期数", "number", "少于该值会视为采集异常。"],
       ["collection.min_publish_date", "最早发布日期", "text", "格式 YYYY-MM-DD；留空表示不限制。"],
       ["collection.login_type", "登录方式", "select", "MediaCrawler 登录方式。", false, ["qrcode", "cookie"]],
+      ["collection.headless", "使用无头浏览器", "boolean", "关闭后采集时打开可见 Chrome；可见模式更便于观察，也可能降低账号被限制的概率。", true],
       ["collection.save_data_option", "原始数据格式", "select", "推荐使用 jsonl。", false, ["jsonl", "json", "csv"]],
       ["collection.profile_max_workers", "主页采集并发", "number", "达人资料采集的最大并发数。"],
       ["collection.profile_ttl_hours", "主页缓存时长（小时）", "number", "缓存未过期时复用本地资料。"],
@@ -101,51 +103,48 @@ const sectionDefinitions = [
     key: "backups",
     icon: "06",
     title: "备份策略",
-    summary: "并发与映射缓存",
-    description: "控制下游备份的并发量与达人目录映射缓存时间。",
-    fields: [
-      ["backups.max_workers", "备份并发数", "number", "最多并行执行的备份目标数。"],
-      ["backups.mapping_cache_ttl_hours", "映射缓存时长（小时）", "number", "远端目录映射的缓存时间。"],
-    ],
-  },
-  {
-    key: "ima",
-    icon: "07",
-    title: "IMA 备份",
-    summary: "腾讯 IMA 知识库",
-    description: "管理 IMA 文案备份开关、达人映射文件和重名处理策略。",
-    fields: [
-      ["ima.enabled", "启用 IMA", "boolean", "备份最终文案到腾讯 IMA。", true],
-      ["ima.mapping", "IMA 映射文件", "text", "达人到知识库/文件夹的本地映射。"],
-      ["ima.on_duplicate", "IMA 重名策略", "select", "日常任务推荐 skip。", false, ["skip", "fail", "rename"]],
-    ],
-  },
-  {
-    key: "kuake",
-    icon: "08",
-    title: "夸克网盘",
-    summary: "网盘文案备份",
-    description: "管理夸克备份开关、私有登录配置、CLI 和目标根目录。",
-    fields: [
-      ["kuake.enabled", "启用夸克", "boolean", "备份最终文案到夸克网盘。", true],
-      ["kuake.local_env", "夸克私有配置", "text", "Cookie 等凭据所在的 local 文件。"],
-      ["kuake.kuake_exe", "夸克 CLI", "text", "本机 kuake 可执行文件路径。"],
-      ["kuake.base_dir", "夸克根目录", "text", "留空时读取私有配置默认目录。"],
-    ],
-  },
-  {
-    key: "obsidian",
-    icon: "09",
-    title: "Obsidian",
-    summary: "本地知识库导出",
-    description: "管理本地知识库目录、笔记模板和按达人类型选择的总结提示词。",
-    fields: [
-      ["obsidian.enabled", "启用 Obsidian", "boolean", "导出本地知识库笔记。", true],
-      ["obsidian.original_dir", "Obsidian 达人根目录", "text", "每位达人会在这里使用独立子目录。", true],
-      ["obsidian.template_file", "通用笔记模板", "text", "所有达人的基础笔记框架。", true],
-      ["obsidian.summary_template_file", "默认总结提示词", "text", "这是提示词，不是直接写入笔记的正文。", true],
-      ["obsidian.creator_type_field", "达人类型字段", "text", "用于选择分类总结提示词。"],
-      ["obsidian.summary_templates_by_creator_type", "按达人类型映射提示词", "json", "填写 JSON 对象，例如 {\"巨量千川\": \"D:/.../提示词.md\"}。", true],
+    summary: "三种备份统一管理",
+    description: "IMA、夸克和 Obsidian 的全部配置集中在本页，三路备份仍会独立执行。",
+    groups: [
+      {
+        title: "公共备份策略",
+        description: "统一控制三种备份的并发和目录映射缓存。",
+        fields: [
+          ["backups.max_workers", "备份并发数", "number", "最多并行执行的备份目标数。"],
+          ["backups.mapping_cache_ttl_hours", "映射缓存时长（小时）", "number", "远端目录映射的缓存时间。"],
+        ],
+      },
+      {
+        title: "腾讯 IMA 知识库",
+        description: "最终文案备份到 IMA 知识库或达人文件夹。",
+        fields: [
+          ["ima.enabled", "启用 IMA", "boolean", "备份最终文案到腾讯 IMA。", true],
+          ["ima.mapping", "IMA 映射文件", "text", "达人到知识库/文件夹的本地映射。"],
+          ["ima.on_duplicate", "IMA 重名策略", "select", "日常任务推荐 skip。", false, ["skip", "fail", "rename"]],
+        ],
+      },
+      {
+        title: "夸克网盘",
+        description: "最终文案按达人目录备份到夸克网盘。",
+        fields: [
+          ["kuake.enabled", "启用夸克", "boolean", "备份最终文案到夸克网盘。", true],
+          ["kuake.local_env", "夸克私有配置", "text", "Cookie 等凭据所在的 local 文件。"],
+          ["kuake.kuake_exe", "夸克 CLI", "text", "本机 kuake 可执行文件路径。"],
+          ["kuake.base_dir", "夸克根目录", "text", "留空时读取私有配置默认目录。"],
+        ],
+      },
+      {
+        title: "Obsidian 本地知识库",
+        description: "最终文案与内容总结导出到本地 Obsidian 达人目录。",
+        fields: [
+          ["obsidian.enabled", "启用 Obsidian", "boolean", "导出本地知识库笔记。", true],
+          ["obsidian.original_dir", "Obsidian 达人根目录", "text", "每位达人会在这里使用独立子目录。", true],
+          ["obsidian.template_file", "通用笔记模板", "text", "所有达人的基础笔记框架。", true],
+          ["obsidian.summary_template_file", "默认总结提示词", "text", "这是提示词，不是直接写入笔记的正文。", true],
+          ["obsidian.creator_type_field", "达人类型字段", "text", "用于选择分类总结提示词。"],
+          ["obsidian.summary_templates_by_creator_type", "按达人类型映射提示词", "json", "填写 JSON 对象，例如 {\"巨量千川\": \"D:/.../提示词.md\"}。", true],
+        ],
+      },
     ],
   },
 ];
@@ -165,7 +164,7 @@ const creatorFields = [
 
 const creatorCategoryDefinition = {
   key: "creators",
-  icon: "10",
+  icon: "07",
   title: "达人信息",
   summary: "统一达人模板",
   description: "所有达人复用同一套信息模板，通过列表切换当前编辑对象。",
@@ -224,13 +223,22 @@ async function api(path, options = {}) {
   return payload;
 }
 
-function formatTime(value) {
+function formatDateTime(value, includeYear = false) {
   if (!value) return "暂无";
   const date = new Date(value);
   if (Number.isNaN(date.valueOf())) return value;
   return new Intl.DateTimeFormat("zh-CN", {
+    ...(includeYear ? { year: "numeric" } : {}),
     month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false,
   }).format(date);
+}
+
+function formatTime(value) {
+  return formatDateTime(value);
+}
+
+function formatFullTime(value) {
+  return formatDateTime(value, true);
 }
 
 function formatDuration(seconds) {
@@ -242,7 +250,7 @@ function formatDuration(seconds) {
 }
 
 function statusText(status) {
-  return ({ Ready: "待命", Running: "运行中", Disabled: "已禁用", success: "成功", partial_failure: "部分失败", failed: "失败", planned: "计划", never: "尚未运行", ready: "已有数据", not_run: "无数据" })[status] || status || "未知";
+  return ({ Ready: "待命", Running: "运行中", running: "进行中", Disabled: "已禁用", success: "成功", partial_failure: "部分失败", failed: "失败", planned: "计划", never: "尚未运行", ready: "已有数据", not_run: "无数据" })[status] || status || "未知";
 }
 
 function renderStatus(data) {
@@ -250,35 +258,44 @@ function renderStatus(data) {
   el("task-pill").className = `task-pill ${running ? "running" : "ready"}`;
   el("task-pill-text").textContent = running ? "任务正在运行" : `任务${statusText(data.task.state)}`;
   el("run-button").disabled = running;
-  el("metric-task").textContent = statusText(data.task.state);
-  el("metric-task-note").textContent = `下次 ${formatTime(data.task.next_run_time)}`;
-  el("metric-run").textContent = statusText(data.latest_run.status);
-  el("metric-run-note").textContent = `${formatTime(data.latest_run.finished_at)} · ${formatDuration(data.latest_run.wall_seconds)}`;
   el("metric-creators").textContent = `${data.total_creators} 位 / ${data.total_works} 条`;
-  el("metric-creators-note").textContent = `待处理 ${data.pending_works} 条`;
+  el("metric-creators-note").textContent = `已启用 ${data.total_creators} 位达人`;
+  el("metric-pending").textContent = `${data.pending_works} 条`;
   el("metric-accounts").textContent = data.account_profiles_total ? `${data.account_profiles_detected} / ${data.account_profiles_total}` : "未启用";
-  el("schedule-last").textContent = formatTime(data.task.last_run_time);
+  el("current-task-state").textContent = statusText(data.task.state);
+  el("current-task-note").textContent = `下次 ${formatTime(data.task.next_run_time)}`;
+  el("current-run-status").textContent = running ? "运行中" : "未开始";
+  el("current-run-note").textContent = running
+    ? `本轮开始于 ${formatTime(data.task.last_run_time)}`
+    : "等待下次计划执行";
+  el("current-duration").textContent = running ? "进行中" : "—";
+  el("schedule-state").textContent = running ? "正在执行" : "等待触发";
+  el("schedule-start").textContent = running ? formatTime(data.task.last_run_time) : "尚未开始";
   el("schedule-next").textContent = formatTime(data.task.next_run_time);
-  el("schedule-code").textContent = data.task.last_result === null ? "暂无" : String(data.task.last_result);
-  el("schedule-duration").textContent = formatDuration(data.latest_run.wall_seconds);
   el("log-name").textContent = data.latest_log ? data.latest_log.split(/[\\/]/).pop() : "暂无日志";
   el("log-output").textContent = data.log_tail || "日志为空。";
 
   const body = el("creator-table-body");
   body.replaceChildren();
-  let failures = 0;
   data.creators.forEach((creator) => {
-    if (["failed", "partial_failure", "not_run"].includes(creator.status)) failures += 1;
     const row = document.createElement("tr");
-    const values = [creator.name, creator.works_count, creator.pending_count, formatTime(creator.works_updated_at)];
+    const values = [
+      creator.name,
+      creator.works_count,
+      creator.pending_count,
+      formatTime(creator.latest_publish_time),
+      formatTime(creator.works_updated_at),
+    ];
     values.forEach((value) => {
       const cell = document.createElement("td"); cell.textContent = value; row.append(cell);
     });
     const statusCell = document.createElement("td");
     const badge = document.createElement("span");
-    badge.className = `status-badge ${creator.status}`; badge.textContent = statusText(creator.status);
+    const latestFailed = ["failed", "partial_failure"].includes(creator.status);
+    const badgeStatus = creator.pending_count ? "planned" : latestFailed ? "failed" : creator.status === "not_run" ? "not_run" : "success";
+    badge.className = `status-badge ${badgeStatus}`;
+    badge.textContent = creator.pending_count ? "有待处理" : latestFailed ? "最近运行异常" : creator.status === "not_run" ? "暂无运行数据" : "数据正常";
     statusCell.append(badge); row.append(statusCell);
-    const detail = document.createElement("td"); detail.textContent = creator.detail || "—"; row.append(detail);
     body.append(row);
   });
   if (!data.creators.length) {
@@ -286,8 +303,120 @@ function renderStatus(data) {
     const cell = document.createElement("td"); cell.colSpan = 6; cell.className = "empty-cell"; cell.textContent = "尚未配置已启用的达人";
     row.append(cell); body.append(row);
   }
-  el("creator-summary").textContent = `${data.total_creators - failures} 正常 · ${failures} 异常`;
+  el("creator-summary").textContent = `${data.total_creators} 位达人 · ${data.total_works} 条作品`;
+
+  const events = Array.isArray(data.activity_events) ? data.activity_events : [];
+  const currentBody = el("current-creator-table-body");
+  currentBody.replaceChildren();
+  const currentCreators = running ? data.creators : [];
+  let currentSuccess = 0;
+  let currentFailed = 0;
+  let currentActive = 0;
+  currentCreators.forEach((creator) => {
+    const creatorEvents = events.filter((event) => {
+      const message = String(event.message || "");
+      return message.includes(creator.name) || message.includes(creator.key);
+    });
+    const latestEvent = creatorEvents[creatorEvents.length - 1];
+    const finalEvent = [...creatorEvents].reverse().find((event) => String(event.message || "").includes("达人结束"));
+    let currentStatus = "planned";
+    if (finalEvent?.level === "failed") currentStatus = "failed";
+    else if (finalEvent?.level === "success") currentStatus = "success";
+    else if (latestEvent) currentStatus = "running";
+    if (currentStatus === "success") currentSuccess += 1;
+    else if (currentStatus === "failed") currentFailed += 1;
+    else currentActive += 1;
+    const row = document.createElement("tr");
+    [creator.name, creator.works_count, creator.pending_count].forEach((value) => {
+      const cell = document.createElement("td"); cell.textContent = value; row.append(cell);
+    });
+    const statusCell = document.createElement("td");
+    const badge = document.createElement("span"); badge.className = `status-badge ${currentStatus}`;
+    badge.textContent = currentStatus === "planned" ? "等待中" : statusText(currentStatus);
+    statusCell.append(badge); row.append(statusCell);
+    const detail = document.createElement("td");
+    detail.textContent = finalEvent?.message || latestEvent?.message || "等待本轮开始处理";
+    row.append(detail);
+    currentBody.append(row);
+  });
+  if (!currentCreators.length) {
+    const row = document.createElement("tr");
+    const cell = document.createElement("td"); cell.colSpan = 5; cell.className = "empty-cell"; cell.textContent = "当前没有正在执行的任务；最近结果请到“历史运行”查看";
+    row.append(cell); currentBody.append(row);
+  }
+  const finishedCreators = currentSuccess + currentFailed;
+  el("current-creator-result").textContent = running ? `${finishedCreators} / ${data.total_creators}` : "—";
+  el("current-creator-result-note").textContent = running ? "已结束 / 全部达人" : "等待任务开始";
+  el("current-creator-summary").textContent = running
+    ? `${currentSuccess} 正常 · ${currentFailed} 异常 · ${currentActive} 等待或进行中`
+    : "当前任务待命";
+
+  const timeline = el("activity-timeline"); timeline.replaceChildren();
+  events.forEach((event) => {
+    const item = document.createElement("div"); item.className = `activity-item ${event.level || "info"}`;
+    const dot = document.createElement("span"); dot.className = "activity-dot";
+    const text = document.createElement("div");
+    const message = document.createElement("strong"); message.textContent = event.message;
+    const time = document.createElement("small"); time.textContent = event.time;
+    text.append(message, time); item.append(dot, text); timeline.append(item);
+  });
+  if (!events.length) {
+    const empty = document.createElement("div"); empty.className = "empty-cell"; empty.textContent = "暂无可展示的执行事件";
+    timeline.append(empty);
+  }
+  el("activity-count").textContent = `${events.length} 条事件`;
   el("status-error").classList.add("hidden");
+}
+
+function renderHistory(data) {
+  state.history = data;
+  const stats = data.stats || {};
+  el("metric-history-rate").textContent = `${stats.success_rate || 0}%`;
+  el("metric-history-note").textContent = `${stats.successful_runs || 0} 次成功 · ${stats.issue_runs || 0} 次异常`;
+  el("overview-history-total").textContent = `${stats.total_runs || 0} 次`;
+  el("overview-history-success").textContent = `${stats.successful_runs || 0} 次`;
+  el("overview-history-issues").textContent = `${stats.issue_runs || 0} 次`;
+  el("overview-latest-success").textContent = formatTime(stats.latest_success_at);
+  el("history-total").textContent = stats.total_runs || 0;
+  el("history-success").textContent = stats.successful_runs || 0;
+  el("history-issues").textContent = stats.issue_runs || 0;
+  el("history-rate").textContent = `${stats.success_rate || 0}%`;
+  el("history-latest-success").textContent = `最近成功：${formatFullTime(stats.latest_success_at)}`;
+
+  const list = el("history-list"); list.replaceChildren();
+  (data.runs || []).forEach((run, index) => {
+    const card = document.createElement("article"); card.className = `history-run-card ${run.status}`;
+    const marker = document.createElement("div"); marker.className = "history-run-marker";
+    marker.textContent = index === 0 ? "上一次" : index === 1 ? "上上次" : `第 ${index + 1} 条`;
+    const main = document.createElement("div"); main.className = "history-run-main";
+    const heading = document.createElement("div"); heading.className = "history-run-heading";
+    const title = document.createElement("strong"); title.textContent = formatFullTime(run.started_at);
+    const badge = document.createElement("span"); badge.className = `status-badge ${run.status}`; badge.textContent = statusText(run.status);
+    heading.append(title, badge);
+    const headline = document.createElement("p"); headline.textContent = run.headline;
+    const meta = document.createElement("div"); meta.className = "history-run-meta";
+    [
+      `耗时 ${formatDuration(run.wall_seconds)}`,
+      `达人 ${run.successful_creators}/${run.creator_count} 正常`,
+      `处理 ${run.selected_count} 条作品`,
+    ].forEach((value) => { const span = document.createElement("span"); span.textContent = value; meta.append(span); });
+    main.append(heading, headline, meta);
+    if (Array.isArray(run.issues) && run.issues.length) {
+      const issues = document.createElement("div"); issues.className = "history-run-issues";
+      run.issues.forEach((issue) => {
+        const item = document.createElement("div");
+        const name = document.createElement("strong"); name.textContent = issue.creator;
+        const message = document.createElement("span"); message.textContent = issue.message;
+        item.append(name, message); issues.append(item);
+      });
+      main.append(issues);
+    }
+    card.append(marker, main); list.append(card);
+  });
+  if (!(data.runs || []).length) {
+    const empty = document.createElement("div"); empty.className = "empty-cell"; empty.textContent = "还没有历史运行记录";
+    list.append(empty);
+  }
 }
 
 async function loadStatus(showFeedback = false) {
@@ -304,6 +433,15 @@ async function loadStatus(showFeedback = false) {
     if (showFeedback) toast(error.message, "error");
   } finally {
     button.disabled = false;
+  }
+}
+
+async function loadHistory(showFeedback = false) {
+  try {
+    renderHistory(await api("/api/history"));
+    if (showFeedback) toast("历史运行记录已刷新");
+  } catch (error) {
+    if (showFeedback) toast(error.message, "error");
   }
 }
 
@@ -387,6 +525,23 @@ function renderConfigCategoryNavigation() {
 
 function renderStandardConfigSection(definition) {
   const section = configSectionShell(definition);
+  if (Array.isArray(definition.groups)) {
+    const groups = document.createElement("div"); groups.className = "backup-config-groups";
+    definition.groups.forEach((groupDefinition) => {
+      const group = document.createElement("section"); group.className = "backup-config-group";
+      const head = document.createElement("div"); head.className = "backup-config-group-head";
+      const title = document.createElement("h3"); title.textContent = groupDefinition.title;
+      const description = document.createElement("p"); description.textContent = groupDefinition.description;
+      head.append(title, description);
+      const fields = document.createElement("div"); fields.className = "fields";
+      groupDefinition.fields.forEach((fieldDefinition) => {
+        fields.append(createField(fieldDefinition, getPath(state.config, fieldDefinition[0]), fieldDefinition[0]));
+      });
+      group.append(head, fields); groups.append(group);
+    });
+    section.append(groups);
+    return section;
+  }
   const fields = document.createElement("div"); fields.className = "fields";
   definition.fields.forEach((fieldDefinition) => {
     fields.append(createField(fieldDefinition, getPath(state.config, fieldDefinition[0]), fieldDefinition[0]));
@@ -730,11 +885,29 @@ function switchTab(tab) {
   state.activeTab = tab;
   document.querySelectorAll("[data-tab-target]").forEach((button) => button.classList.toggle("active", button.dataset.tabTarget === tab));
   document.querySelectorAll(".tab-page").forEach((page) => page.classList.toggle("active", page.id === `tab-${tab}`));
-  el("page-title").textContent = tab === "overview" ? "运行总览" : "项目配置";
+  el("page-title").textContent = ({
+    overview: "项目总览",
+    current: "当前任务",
+    history: "历史运行",
+    config: "项目配置",
+  })[tab] || "项目总览";
+  if (tab === "current") loadStatus(false);
+  if (tab === "history") loadHistory(false);
+}
+
+async function refreshActivePage() {
+  if (state.activeTab === "history") return loadHistory(true);
+  if (state.activeTab === "overview") {
+    await Promise.all([loadStatus(false), loadHistory(false)]);
+    toast("项目总览已刷新");
+    return;
+  }
+  if (state.activeTab === "config") return loadConfig(true);
+  return loadStatus(true);
 }
 
 document.querySelectorAll("[data-tab-target]").forEach((button) => button.addEventListener("click", () => switchTab(button.dataset.tabTarget)));
-el("refresh-button").addEventListener("click", () => loadStatus(true));
+el("refresh-button").addEventListener("click", refreshActivePage);
 el("run-button").addEventListener("click", runNow);
 el("save-config-button").addEventListener("click", saveConfig);
 el("config-form").addEventListener("input", markDirty);
@@ -749,8 +922,10 @@ window.addEventListener("beforeunload", (event) => {
 });
 
 loadStatus(false);
+loadHistory(false);
 loadConfig(false);
-setInterval(() => { if (state.activeTab === "overview") loadStatus(false); }, 12_000);
+setInterval(() => { if (["overview", "current"].includes(state.activeTab)) loadStatus(false); }, 12_000);
+setInterval(() => { if (["overview", "history"].includes(state.activeTab)) loadHistory(false); }, 30_000);
 setInterval(() => {
   if (state.activeTab === "config" && state.activeConfigCategory === "accounts" && !state.dirty) {
     loadAccountPoolStatus(false);

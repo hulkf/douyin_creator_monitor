@@ -850,6 +850,7 @@ def run_mediacrawler(
                 "import asyncio, ctypes, json, os, runpy, subprocess, sys, time",
                 f"INTERACTIVE_LOGIN_EXIT_CODE = {INTERACTIVE_LOGIN_EXIT_CODE}",
                 f"interactive_login = os.environ.get({INTERACTIVE_LOGIN_ENV!r}) == '1'",
+                f"requested_headless = {bool(getattr(args, 'headless', True))!r}",
                 f"login_only = {bool(getattr(args, 'login_only', False))!r}",
                 "def _visible_blank_chrome_windows():",
                 "    if os.name != 'nt':",
@@ -886,10 +887,10 @@ def run_mediacrawler(
                 "def _popen_without_startup_window(command, *args, **kwargs):",
                 "    if isinstance(command, (list, tuple)) and any(str(part).startswith('--remote-debugging-port=') for part in command):",
                 "        command = list(command)",
-                "        if '--no-startup-window' not in command:",
+                "        if requested_headless and not interactive_login and '--no-startup-window' not in command:",
                 "            command.append('--no-startup-window')",
-                "        existing_blank_windows = _visible_blank_chrome_windows() if not interactive_login else set()",
-                "        if os.name == 'nt' and not interactive_login:",
+                "        existing_blank_windows = _visible_blank_chrome_windows() if requested_headless and not interactive_login else set()",
+                "        if os.name == 'nt' and requested_headless and not interactive_login:",
                 "            kwargs['creationflags'] = int(kwargs.get('creationflags', 0)) | subprocess.CREATE_NO_WINDOW",
                 "            startupinfo = kwargs.get('startupinfo') or subprocess.STARTUPINFO()",
                 "            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW",
@@ -897,7 +898,7 @@ def run_mediacrawler(
                 "            kwargs['startupinfo'] = startupinfo",
                 "        print('[collector] chrome launch flags headless=' + str('--headless=new' in command).lower() + ' no_startup=' + str('--no-startup-window' in command).lower())",
                 "        process = _original_popen(command, *args, **kwargs)",
-                "        if not interactive_login:",
+                "        if requested_headless and not interactive_login:",
                 "            _close_new_blank_chrome_windows(existing_blank_windows)",
                 "        return process",
                 "    return _original_popen(command, *args, **kwargs)",
@@ -907,11 +908,11 @@ def run_mediacrawler(
                 "import config",
                 "config.ENABLE_CDP_MODE = True",
                 "config.CDP_CONNECT_EXISTING = False",
-                "config.HEADLESS = not interactive_login",
-                "config.CDP_HEADLESS = not interactive_login",
+                "config.HEADLESS = requested_headless and not interactive_login",
+                "config.CDP_HEADLESS = requested_headless and not interactive_login",
                 f"config.CDP_DEBUG_PORT = {cdp_port}",
                 f"config.USER_DATA_DIR = {f'{browser_profile_key}_%s_user_data_dir'!r}",
-                f"print('[collector] isolated browser profile={browser_profile_key} cdp_port_start={cdp_port} visible=' + str(interactive_login).lower())",
+                f"print('[collector] isolated browser profile={browser_profile_key} cdp_port_start={cdp_port} visible=' + str(not requested_headless or interactive_login).lower())",
                 "from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError",
                 "_original_page_goto = Page.goto",
                 "async def _page_goto_with_retry(self, url, **kwargs):",
@@ -1043,7 +1044,7 @@ def run_mediacrawler(
                 "    '--save_data_option', " + repr(args.save_data_option) + ",",
                 "    '--save_data_path', " + repr(str(output_dir)) + ",",
                 "    '--get_comment', 'false',",
-                "    '--headless', 'false' if interactive_login else 'true',",
+                "    '--headless', 'true' if requested_headless and not interactive_login else 'false',",
                 "]",
                 "runpy.run_path(str(media_dir / 'main.py'), run_name='__main__')",
             ]
@@ -1218,6 +1219,10 @@ def main() -> int:
     parser.add_argument("--save-data-option", default="jsonl", choices=["jsonl", "json", "csv"])
     parser.add_argument("--normalize-only", action="store_true", help="Skip running MediaCrawler; only normalize existing output files.")
     parser.add_argument("--clean-media-output", action="store_true")
+    browser_mode = parser.add_mutually_exclusive_group()
+    browser_mode.add_argument("--headless", dest="headless", action="store_true")
+    browser_mode.add_argument("--visible-browser", dest="headless", action="store_false")
+    parser.set_defaults(headless=True)
     parser.add_argument(
         "--login-only",
         action="store_true",

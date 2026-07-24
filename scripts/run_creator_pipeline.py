@@ -658,6 +658,9 @@ def collect_command(
     append_option(command, "--profile-output-file", profile_output_file)
     if chosen(creator, defaults, "clean_media_output", False):
         command.append("--clean-media-output")
+    command.append(
+        "--headless" if chosen(creator, defaults, "headless", True) else "--visible-browser"
+    )
     incremental_enabled = bool(chosen(creator, defaults, "incremental_enabled", True))
     if force_full_collect or not incremental_enabled:
         command.append("--force-full-collect")

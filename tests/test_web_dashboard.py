@@ -200,8 +200,111 @@ class WebDashboardPayloadTests(unittest.TestCase):
         self.assertEqual(payload["task"]["state"], "Ready")
         self.assertEqual(payload["latest_run"]["finished_at"], now.isoformat())
         self.assertEqual(payload["creators"][0]["name"], "达人 A")
-        self.assertEqual(payload["latest_log"], "pipeline.log")
+        self.assertIsNone(payload["latest_log"])
+        self.assertEqual(payload["activity_events"], [])
+        self.assertEqual(payload["log_tail"], "当前没有正在执行的任务。")
         json.dumps(payload)
+
+        running_payload = WEB.snapshot_payload(snapshot._replace(
+            task=dashboard.TaskInfo("Running", now, now, None),
+            log_tail="[2026-07-24 18:30:00] 流水线开始",
+        ))
+        self.assertEqual(running_payload["latest_log"], "pipeline.log")
+        self.assertEqual(running_payload["activity_events"][0]["message"], "流水线已启动")
+
+    def test_run_history_summarizes_recent_results_without_raw_tracebacks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "config").mkdir()
+            (root / "local").mkdir()
+            runs = root / "runtime" / "pipeline" / "runs"
+            runs.mkdir(parents=True)
+            config = {**valid_config(), "state_dir": "runtime/pipeline"}
+            (root / "config" / "pipeline.example.json").write_text(
+                json.dumps(config), encoding="utf-8"
+            )
+            (root / "local" / "pipeline.json").write_text(
+                json.dumps(config), encoding="utf-8"
+            )
+            (runs / "20260723-090000.json").write_text(json.dumps({
+                "run_id": "20260723-090000",
+                "started_at": "2026-07-23T09:00:00+08:00",
+                "finished_at": "2026-07-23T09:02:00+08:00",
+                "wall_seconds": 120,
+                "status": "success",
+                "creators": [{
+                    "key": "a", "creator_name": "达人 A", "status": "success",
+                    "selected_count": 2, "pending_count": 0, "works": [{"status": "success"}],
+                }],
+            }), encoding="utf-8")
+            (runs / "20260724-090000.json").write_text(json.dumps({
+                "run_id": "20260724-090000",
+                "started_at": "2026-07-24T09:00:00+08:00",
+                "finished_at": "2026-07-24T09:03:00+08:00",
+                "wall_seconds": 180,
+                "status": "partial_failure",
+                "creators": [
+                    {"key": "a", "creator_name": "达人 A", "status": "success", "selected_count": 0},
+                    {
+                        "key": "b", "creator_name": "达人 B", "status": "partial_failure",
+                        "collection_error": "Traceback ... account blocked ... local secret path",
+                    },
+                ],
+            }), encoding="utf-8")
+            (runs / "20260725-090000.json").write_text(json.dumps({
+                "run_id": "20260725-090000",
+                "status": "planned",
+                "dry_run": True,
+                "creators": [],
+            }), encoding="utf-8")
+
+            payload = WEB.run_history_payload(root)
+
+            self.assertEqual(payload["stats"]["total_runs"], 2)
+            self.assertEqual(payload["stats"]["successful_runs"], 1)
+            self.assertEqual(payload["runs"][0]["run_id"], "20260724-090000")
+            self.assertEqual(payload["runs"][0]["successful_creators"], 1)
+            self.assertEqual(payload["runs"][0]["failed_creators"], 1)
+            self.assertEqual(payload["runs"][0]["issues"][0]["message"], "抖音账号被风控（account blocked）")
+            serialized = json.dumps(payload, ensure_ascii=False)
+            self.assertNotIn("Traceback", serialized)
+            self.assertNotIn("local secret path", serialized)
+
+    def test_public_error_summary_hides_windows_paths(self):
+        summary = WEB.public_error_summary(
+            r"作品文件不存在: D:\JR_project\douyin_creator_monitor\runtime\creator-works.json"
+        )
+
+        self.assertEqual(summary, "本地作品数据文件不存在")
+        self.assertNotIn("D:\\", summary)
+
+    def test_public_error_summary_hides_lowercase_tracebacks_and_posix_paths(self):
+        self.assertEqual(
+            WEB.public_error_summary("worker failed: traceback at /tmp/runtime/secret.py"),
+            "运行组件异常，请查看技术日志",
+        )
+        self.assertEqual(
+            WEB.public_error_summary("worker failed at /home/user/private/config.json"),
+            "本地文件或目录异常，请查看技术日志",
+        )
+
+    def test_activity_events_classify_creator_completion_statuses(self):
+        events = WEB.activity_events(
+            "[2026-07-24 18:30:00] ========== 达人结束: 达人 A，状态 success ==========\n"
+            "[2026-07-24 18:31:00] ========== 达人结束: 达人 B，状态 partial_failure =========="
+        )
+
+        self.assertEqual([event["level"] for event in events], ["success", "failed"])
+
+    def test_history_normalizes_internal_failure_statuses(self):
+        summary = WEB.summarize_run({
+            "run_id": "blocked",
+            "status": "blocked_before_downstream",
+            "creators": [{"key": "a", "status": "blocked_before_downstream"}],
+        })
+
+        self.assertEqual(summary["status"], "failed")
+        self.assertEqual(summary["failed_creators"], 1)
 
 
 class WebDashboardStaticTests(unittest.TestCase):
@@ -214,6 +317,30 @@ class WebDashboardStaticTests(unittest.TestCase):
         self.assertIn('id="config-category-content"', html)
         self.assertIn("function switchConfigCategory", javascript)
         self.assertIn("function syncVisibleConfigToState", javascript)
+
+    def test_main_navigation_separates_overview_current_task_and_history(self):
+        project_dir = Path(__file__).resolve().parents[1]
+        html = (project_dir / "web" / "index.html").read_text(encoding="utf-8")
+        javascript = (project_dir / "web" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn('data-tab-target="overview"', html)
+        self.assertIn('data-tab-target="current"', html)
+        self.assertIn('data-tab-target="history"', html)
+        self.assertIn('id="tab-current"', html)
+        self.assertIn('id="tab-history"', html)
+        self.assertNotIn("当次 / 最近结果", html)
+        self.assertIn("当前没有正在执行的任务", javascript)
+
+    def test_all_backup_destinations_share_the_backup_strategy_category(self):
+        project_dir = Path(__file__).resolve().parents[1]
+        javascript = (project_dir / "web" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn('["ima.enabled"', javascript)
+        self.assertIn('["kuake.enabled"', javascript)
+        self.assertIn('["obsidian.enabled"', javascript)
+        self.assertNotIn('key: "ima"', javascript)
+        self.assertNotIn('key: "kuake"', javascript)
+        self.assertNotIn('key: "obsidian"', javascript)
 
 
 class WebDashboardHttpTests(unittest.TestCase):
@@ -234,12 +361,14 @@ class WebDashboardHttpTests(unittest.TestCase):
         self.task_starter = Mock(return_value="started")
         self.account_status_provider = Mock(return_value={"profiles": []})
         self.account_login_starter = Mock(return_value={"message": "login started"})
+        self.history_provider = Mock(return_value={"stats": {"total_runs": 0}, "runs": []})
         handler = WEB.make_handler(
             self.root,
             snapshot_builder=self.snapshot_builder,
             task_starter=self.task_starter,
             account_status_provider=self.account_status_provider,
             account_login_starter=self.account_login_starter,
+            history_provider=self.history_provider,
         )
         self.server = WEB.ThreadingHTTPServer(("127.0.0.1", 0), handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -297,6 +426,13 @@ class WebDashboardHttpTests(unittest.TestCase):
         self.assertEqual(status, 202)
         self.assertEqual(payload["message"], "login started")
         self.account_login_starter.assert_called_once_with("account-a", self.root)
+
+    def test_history_api_returns_plain_language_run_summaries(self):
+        status, payload = self.request("/api/history")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["stats"]["total_runs"], 0)
+        self.history_provider.assert_called_once_with(self.root)
 
     def test_invalid_config_returns_400_without_overwriting_file(self):
         before = (self.root / "local" / "pipeline.json").read_text(encoding="utf-8")

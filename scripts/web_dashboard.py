@@ -34,6 +34,8 @@ CONFIG_BACKUP_RELATIVE_PATH = Path("local") / "pipeline.backup.json"
 CONFIG_TEMPLATE_RELATIVE_PATH = Path("config") / "pipeline.example.json"
 WEB_DIR_RELATIVE_PATH = Path("web")
 MAX_REQUEST_BYTES = 2 * 1024 * 1024
+MAX_HISTORY_FILES = 100
+DEFAULT_HISTORY_LIMIT = 30
 CREATOR_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 _CONFIG_LOCK = threading.Lock()
 _ACCOUNT_LOGIN_LOCK = threading.Lock()
@@ -190,7 +192,7 @@ def validate_pipeline_config(config: Any) -> list[str]:
         errors,
         minimum=0,
     )
-    for key in ("incremental_enabled", "clean_media_output"):
+    for key in ("incremental_enabled", "clean_media_output", "headless"):
         _check_boolean(collection, key, f"collection.{key}", errors)
     profiles = collection.get("account_profiles", [])
     if not isinstance(profiles, list) or any(not isinstance(item, str) for item in profiles):
@@ -317,6 +319,7 @@ def _iso(value: datetime | None) -> str | None:
 
 
 def snapshot_payload(snapshot: GUI.DashboardSnapshot) -> dict[str, Any]:
+    running = snapshot.task.state.casefold() == "running"
     return {
         "task": {
             "state": snapshot.task.state,
@@ -350,9 +353,166 @@ def snapshot_payload(snapshot: GUI.DashboardSnapshot) -> dict[str, Any]:
         "pending_works": snapshot.pending_works,
         "account_profiles_total": snapshot.account_profiles_total,
         "account_profiles_detected": snapshot.account_profiles_detected,
-        "latest_log": str(snapshot.latest_log) if snapshot.latest_log else None,
-        "log_tail": snapshot.log_tail,
+        "latest_log": str(snapshot.latest_log) if running and snapshot.latest_log else None,
+        "log_tail": snapshot.log_tail if running else "当前没有正在执行的任务。",
+        "activity_events": activity_events(snapshot.log_tail) if running else [],
         "refreshed_at": _iso(snapshot.refreshed_at),
+    }
+
+
+def public_error_summary(value: Any) -> str:
+    text = " ".join(str(value or "").split())
+    if not text:
+        return "运行未完成"
+    lowered = text.lower()
+    if "account blocked" in lowered:
+        return "抖音账号被风控（account blocked）"
+    if "200005" in lowered or "请求超量" in text:
+        return "IMA 当日请求额度已用完"
+    if "timeout" in lowered or "超时" in text:
+        return "网络请求超时"
+    if any(marker in lowered for marker in ("dns", "connection refused", "network is unreachable")):
+        return "网络连接异常"
+    if "作品文件不存在" in text:
+        return "本地作品数据文件不存在"
+    if "filenotfounderror" in lowered or "no such file" in lowered:
+        return "本地文件不存在"
+    if "traceback" in lowered:
+        return "运行组件异常，请查看技术日志"
+    if re.search(r"(?:[A-Za-z]:[\\/]|\\\\)", text) or re.search(
+        r"(?:^|\s)/(?:tmp|home|users|var|opt|srv|mnt)(?:/|\b)", lowered,
+    ):
+        return "本地文件或目录异常，请查看技术日志"
+    prefix = re.split(r"\s+(?:\d{4}-\d{2}-\d{2}|Traceback)", text, maxsplit=1)[0]
+    return GUI.summarize_error(prefix.rstrip("：:,， "), limit=90) or "运行未完成"
+
+
+def activity_events(log_tail: str, limit: int = 40) -> list[dict[str, str]]:
+    events: list[dict[str, str]] = []
+    pattern = re.compile(r"^\[([^\]]+)\]\s*(.+)$")
+    for raw_line in str(log_tail or "").splitlines():
+        match = pattern.match(raw_line.strip())
+        if not match:
+            continue
+        timestamp, message = match.groups()
+        if " stdout:" in message or " stderr:" in message:
+            continue
+        if message.startswith("流水线开始"):
+            message = "流水线已启动"
+        elif message.startswith("开始 ") and ":" in message:
+            message = message.split(":", 1)[0]
+        lowered_message = message.lower()
+        if (
+            any(word in message for word in ("失败", "异常", "封控", "耗尽"))
+            or "partial_failure" in lowered_message
+            or re.search(r"(?:状态|status)\s*[=:]?\s*failed\b", lowered_message)
+        ):
+            level = "failed"
+        elif (
+            any(word in message for word in ("完成", "成功"))
+            or re.search(r"(?:状态|status)\s*[=:]?\s*success\b", lowered_message)
+        ):
+            level = "success"
+        else:
+            level = "info"
+        events.append({"time": timestamp, "message": message[:180], "level": level})
+    return events[-max(1, limit):]
+
+
+def summarize_run(payload: dict[str, Any]) -> dict[str, Any]:
+    creators = [item for item in payload.get("creators", []) if isinstance(item, dict)]
+    successful = [item for item in creators if item.get("status") == "success"]
+    failed = [item for item in creators if item.get("status") != "success"]
+    selected_count = sum(int(item.get("selected_count") or 0) for item in creators)
+    pending_count = sum(int(item.get("pending_count") or 0) for item in creators)
+    work_results = [
+        work
+        for creator in creators
+        for work in creator.get("works", [])
+        if isinstance(work, dict)
+    ]
+    issues: list[dict[str, str]] = []
+    if payload.get("error"):
+        issues.append({"creator": "整体任务", "message": public_error_summary(payload["error"])})
+    for creator in failed:
+        error = (
+            creator.get("collection_error")
+            or creator.get("profile_sync_error")
+            or creator.get("error")
+            or "运行未完成"
+        )
+        issues.append({
+            "creator": str(creator.get("creator_name") or creator.get("key") or "未命名达人"),
+            "message": public_error_summary(error),
+        })
+    raw_status = str(payload.get("status") or "failed")
+    status = raw_status if raw_status in {"success", "partial_failure"} else "failed"
+    if status == "success":
+        headline = f"检查 {len(creators)} 位达人，本次处理 {selected_count} 条作品，运行成功"
+    elif creators:
+        headline = f"{len(successful)} 位达人正常，{len(failed)} 位异常，本次处理 {selected_count} 条作品"
+    else:
+        headline = issues[0]["message"] if issues else "本次运行未完成"
+    return {
+        "run_id": str(payload.get("run_id") or ""),
+        "status": status,
+        "started_at": payload.get("started_at"),
+        "finished_at": payload.get("finished_at"),
+        "wall_seconds": float(payload.get("wall_seconds") or 0),
+        "creator_count": len(creators),
+        "successful_creators": len(successful),
+        "failed_creators": len(failed),
+        "selected_count": selected_count,
+        "pending_count": pending_count,
+        "successful_works": sum(1 for item in work_results if item.get("status") == "success"),
+        "failed_works": sum(
+            1 for item in work_results if item.get("status") in {"failed", "partial_failure"}
+        ),
+        "failed_calls": int((payload.get("timings") or {}).get("failed_calls") or 0)
+        if isinstance(payload.get("timings"), dict) else 0,
+        "headline": headline,
+        "issues": issues[:5],
+    }
+
+
+def run_history_payload(
+    project_dir: Path = PROJECT_DIR,
+    limit: int = DEFAULT_HISTORY_LIMIT,
+) -> dict[str, Any]:
+    project_dir = project_dir.resolve()
+    config = load_pipeline_config(project_dir).config
+    state_dir = GUI.project_path(
+        project_dir,
+        config.get("state_dir"),
+        project_dir / "runtime" / "pipeline",
+    )
+    try:
+        files = sorted(
+            (path for path in (state_dir / "runs").glob("*.json") if path.is_file()),
+            key=lambda path: path.name,
+            reverse=True,
+        )[:MAX_HISTORY_FILES]
+    except OSError:
+        files = []
+    runs: list[dict[str, Any]] = []
+    for path in files:
+        payload = GUI.read_json(path)
+        if payload and payload.get("status") != "planned" and payload.get("dry_run") is not True:
+            runs.append(summarize_run(payload))
+    successful_runs = sum(1 for item in runs if item["status"] == "success")
+    issue_runs = sum(1 for item in runs if item["status"] in {"failed", "partial_failure"})
+    latest_success = next((item.get("finished_at") for item in runs if item["status"] == "success"), None)
+    total_runs = len(runs)
+    return {
+        "stats": {
+            "total_runs": total_runs,
+            "successful_runs": successful_runs,
+            "issue_runs": issue_runs,
+            "success_rate": round(successful_runs * 100 / total_runs) if total_runs else 0,
+            "latest_success_at": latest_success,
+            "window_size": MAX_HISTORY_FILES,
+        },
+        "runs": runs[:max(1, min(int(limit), MAX_HISTORY_FILES))],
     }
 
 
@@ -524,6 +684,7 @@ def make_handler(
     task_starter: Callable[[str], str] = GUI.start_scheduled_task,
     account_status_provider: Callable[[Path], dict[str, Any]] = account_pool_payload,
     account_login_starter: Callable[[str, Path], dict[str, Any]] = start_account_login,
+    history_provider: Callable[[Path], dict[str, Any]] = run_history_payload,
 ) -> type[BaseHTTPRequestHandler]:
     project_dir = project_dir.resolve()
     web_dir = project_dir / WEB_DIR_RELATIVE_PATH
@@ -609,6 +770,8 @@ def make_handler(
                     self._json(HTTPStatus.OK, snapshot_payload(snapshot_builder(project_dir)))
                 elif path == "/api/accounts":
                     self._json(HTTPStatus.OK, account_status_provider(project_dir))
+                elif path == "/api/history":
+                    self._json(HTTPStatus.OK, history_provider(project_dir))
                 elif path.startswith("/api/"):
                     self._error(HTTPStatus.NOT_FOUND, "接口不存在")
                 else:

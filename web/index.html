@@ -21,7 +21,13 @@
 
         <nav class="nav" aria-label="主导航">
           <button class="nav-item active" type="button" data-tab-target="overview">
-            <span class="nav-icon">⌁</span><span>运行总览</span>
+            <span class="nav-icon">⌁</span><span>项目总览</span>
+          </button>
+          <button class="nav-item" type="button" data-tab-target="current">
+            <span class="nav-icon">▶</span><span>当前任务</span>
+          </button>
+          <button class="nav-item" type="button" data-tab-target="history">
+            <span class="nav-icon">↺</span><span>历史运行</span>
           </button>
           <button class="nav-item" type="button" data-tab-target="config">
             <span class="nav-icon">⌘</span><span>项目配置</span>
@@ -41,7 +47,7 @@
         <header class="topbar">
           <div>
             <p class="eyebrow">DOUYIN CREATOR MONITOR</p>
-            <h1 id="page-title">运行总览</h1>
+            <h1 id="page-title">项目总览</h1>
           </div>
           <div class="top-actions">
             <div class="task-pill" id="task-pill">
@@ -61,21 +67,21 @@
           <div class="metric-grid">
             <article class="metric-card coral">
               <div class="metric-icon">⌁</div>
-              <div class="metric-label">定时任务</div>
-              <div class="metric-value" id="metric-task">—</div>
-              <div class="metric-note" id="metric-task-note">正在读取</div>
+              <div class="metric-label">监控规模</div>
+              <div class="metric-value" id="metric-creators">—</div>
+              <div class="metric-note" id="metric-creators-note">正在汇总达人数据</div>
             </article>
             <article class="metric-card blue">
               <div class="metric-icon">↗</div>
-              <div class="metric-label">最近运行</div>
-              <div class="metric-value" id="metric-run">—</div>
-              <div class="metric-note" id="metric-run-note">暂无数据</div>
+              <div class="metric-label">待处理作品</div>
+              <div class="metric-value" id="metric-pending">—</div>
+              <div class="metric-note">等待转写、回写或备份</div>
             </article>
             <article class="metric-card violet">
               <div class="metric-icon">◎</div>
-              <div class="metric-label">达人 / 作品</div>
-              <div class="metric-value" id="metric-creators">—</div>
-              <div class="metric-note" id="metric-creators-note">待处理 — 条</div>
+              <div class="metric-label">近期运行成功率</div>
+              <div class="metric-value" id="metric-history-rate">—</div>
+              <div class="metric-note" id="metric-history-note">正在读取历史记录</div>
             </article>
             <article class="metric-card green">
               <div class="metric-icon">◫</div>
@@ -90,7 +96,7 @@
               <div class="panel-header">
                 <div>
                   <p class="panel-kicker">CREATORS</p>
-                  <h2>达人运行状态</h2>
+                  <h2>达人数据概况</h2>
                 </div>
                 <span class="panel-meta" id="creator-summary">—</span>
               </div>
@@ -101,9 +107,9 @@
                       <th>达人</th>
                       <th>作品</th>
                       <th>待处理</th>
-                      <th>更新时间</th>
-                      <th>状态</th>
-                      <th>说明</th>
+                      <th>最近作品</th>
+                      <th>数据更新时间</th>
+                      <th>数据状态</th>
                     </tr>
                   </thead>
                   <tbody id="creator-table-body">
@@ -116,32 +122,159 @@
             <section class="panel schedule-panel">
               <div class="panel-header compact">
                 <div>
-                  <p class="panel-kicker">SCHEDULE</p>
-                  <h2>任务计划</h2>
+                  <p class="panel-kicker">PROJECT HEALTH</p>
+                  <h2>历史运行概况</h2>
                 </div>
               </div>
               <div class="schedule-list">
-                <div><span>上次运行</span><strong id="schedule-last">—</strong></div>
-                <div><span>下次运行</span><strong id="schedule-next">—</strong></div>
-                <div><span>最近退出码</span><strong id="schedule-code">—</strong></div>
-                <div><span>本轮耗时</span><strong id="schedule-duration">—</strong></div>
+                <div><span>统计运行次数</span><strong id="overview-history-total">—</strong></div>
+                <div><span>成功次数</span><strong id="overview-history-success">—</strong></div>
+                <div><span>异常次数</span><strong id="overview-history-issues">—</strong></div>
+                <div><span>最近一次成功</span><strong id="overview-latest-success">—</strong></div>
               </div>
               <div class="schedule-hint">
                 <span>i</span>
-                页面只通过 Windows 任务计划程序点燃正式流水线。
+                这里只展示项目累计情况；当次执行请前往“当前任务”。
+              </div>
+            </section>
+          </div>
+        </section>
+
+        <section class="tab-page" id="tab-current">
+          <div class="metric-grid">
+            <article class="metric-card coral">
+              <div class="metric-icon">▶</div>
+              <div class="metric-label">计划任务状态</div>
+              <div class="metric-value" id="current-task-state">—</div>
+              <div class="metric-note" id="current-task-note">正在读取</div>
+            </article>
+            <article class="metric-card blue">
+              <div class="metric-icon">↗</div>
+              <div class="metric-label">当次执行状态</div>
+              <div class="metric-value" id="current-run-status">—</div>
+              <div class="metric-note" id="current-run-note">暂无运行摘要</div>
+            </article>
+            <article class="metric-card violet">
+              <div class="metric-icon">◎</div>
+              <div class="metric-label">达人执行情况</div>
+              <div class="metric-value" id="current-creator-result">—</div>
+              <div class="metric-note" id="current-creator-result-note">等待任务开始</div>
+            </article>
+            <article class="metric-card green">
+              <div class="metric-icon">◷</div>
+              <div class="metric-label">执行耗时</div>
+              <div class="metric-value" id="current-duration">—</div>
+              <div class="metric-note">仅统计当前执行</div>
+            </article>
+          </div>
+
+          <div class="overview-grid">
+            <section class="panel creators-panel">
+              <div class="panel-header">
+                <div>
+                  <p class="panel-kicker">CURRENT EXECUTION</p>
+                  <h2>当次达人执行明细</h2>
+                </div>
+                <span class="panel-meta" id="current-creator-summary">—</span>
+              </div>
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>达人</th>
+                      <th>作品总数</th>
+                      <th>待处理</th>
+                      <th>状态</th>
+                      <th>发生了什么</th>
+                    </tr>
+                  </thead>
+                  <tbody id="current-creator-table-body">
+                    <tr><td colspan="5" class="empty-cell">正在读取执行数据…</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </section>
+
+            <section class="panel schedule-panel">
+              <div class="panel-header compact">
+                <div>
+                  <p class="panel-kicker">SCHEDULE</p>
+                  <h2>本次执行计划</h2>
+                </div>
+              </div>
+              <div class="schedule-list">
+                <div><span>计划状态</span><strong id="schedule-state">—</strong></div>
+                <div><span>本轮开始</span><strong id="schedule-start">—</strong></div>
+                <div><span>下次触发</span><strong id="schedule-next">—</strong></div>
+                <div><span>触发方式</span><strong>Windows 任务计划</strong></div>
+              </div>
+              <div class="schedule-hint">
+                <span>i</span>
+                “立即运行”只会通过 Windows 任务计划程序启动正式流水线。
               </div>
             </section>
           </div>
 
-          <section class="panel log-panel">
+          <section class="panel activity-panel">
             <div class="panel-header compact">
               <div>
-                <p class="panel-kicker">LATEST LOG</p>
-                <h2>最新流水线日志</h2>
+                <p class="panel-kicker">ACTIVITY</p>
+                <h2>当次执行事件</h2>
               </div>
-              <span class="panel-meta mono" id="log-name">暂无日志</span>
+              <span class="panel-meta" id="activity-count">—</span>
             </div>
-            <pre id="log-output">正在读取日志…</pre>
+            <div class="activity-timeline" id="activity-timeline">
+              <div class="empty-cell">正在读取执行事件…</div>
+            </div>
+          </section>
+
+          <section class="panel log-panel">
+            <details>
+              <summary>查看技术日志 <span class="mono" id="log-name">暂无日志</span></summary>
+              <pre id="log-output">正在读取日志…</pre>
+            </details>
+          </section>
+        </section>
+
+        <section class="tab-page" id="tab-history">
+          <div class="metric-grid">
+            <article class="metric-card coral">
+              <div class="metric-icon">↺</div>
+              <div class="metric-label">统计运行次数</div>
+              <div class="metric-value" id="history-total">—</div>
+              <div class="metric-note">最多统计最近 100 次</div>
+            </article>
+            <article class="metric-card green">
+              <div class="metric-icon">✓</div>
+              <div class="metric-label">成功运行</div>
+              <div class="metric-value" id="history-success">—</div>
+              <div class="metric-note" id="history-latest-success">最近成功：暂无</div>
+            </article>
+            <article class="metric-card coral">
+              <div class="metric-icon">!</div>
+              <div class="metric-label">异常运行</div>
+              <div class="metric-value" id="history-issues">—</div>
+              <div class="metric-note">包含失败和部分失败</div>
+            </article>
+            <article class="metric-card violet">
+              <div class="metric-icon">%</div>
+              <div class="metric-label">运行成功率</div>
+              <div class="metric-value" id="history-rate">—</div>
+              <div class="metric-note">按当前历史窗口计算</div>
+            </article>
+          </div>
+
+          <section class="panel history-panel">
+            <div class="panel-header">
+              <div>
+                <p class="panel-kicker">RUN HISTORY</p>
+                <h2>历史运行记录</h2>
+              </div>
+              <span class="panel-meta">最近一次在最上方</span>
+            </div>
+            <div class="history-list" id="history-list">
+              <div class="empty-cell">正在读取历史运行记录…</div>
+            </div>
           </section>
         </section>
 
