@@ -1,10 +1,20 @@
 "use strict";
 
-const state = { config: null, dirty: false, activeTab: "overview" };
+const state = {
+  config: null,
+  dirty: false,
+  activeTab: "overview",
+  activeConfigCategory: "general",
+  activeCreatorIndex: 0,
+  accountPool: { profiles: [] },
+};
 
 const sectionDefinitions = [
   {
+    key: "general",
+    icon: "01",
     title: "基础设置",
+    summary: "运行路径与目录",
     description: "流水线运行时使用的解释器、处理上限和本地目录。",
     fields: [
       ["python", "Python 路径", "text", "留空时使用启动 Web 服务的 Python。", true],
@@ -15,7 +25,10 @@ const sectionDefinitions = [
     ],
   },
   {
+    key: "collection",
+    icon: "02",
     title: "作品采集",
+    summary: "MediaCrawler 与增量策略",
     description: "MediaCrawler、增量策略、账号池和浏览器隔离参数。",
     fields: [
       ["collection.incremental_enabled", "启用增量采集", "boolean", "遇到已知作品后停止继续翻页。", true],
@@ -31,12 +44,14 @@ const sectionDefinitions = [
       ["collection.profile_ttl_hours", "主页缓存时长（小时）", "number", "缓存未过期时复用本地资料。"],
       ["collection.cdp_port_start", "CDP 起始端口", "number", "每位达人使用独立端口。"],
       ["collection.cdp_port_stride", "CDP 端口步长", "number", "默认每个账号间隔 10。"],
-      ["collection.account_profiles", "账号池 Profile", "lines", "每行一个 profile key，按顺序尝试。", true],
       ["collection.clean_media_output", "采集前清理本轮输出", "boolean", "只清理独立运行目录，不影响历史规范化数据。", true],
     ],
   },
   {
+    key: "feishu",
+    icon: "03",
     title: "飞书同步",
+    summary: "Base 表格与字段",
     description: "这里只维护表格标识与字段名；Base Token 本身不写入配置。",
     fields: [
       ["feishu.creator_table_id", "达人基础表 ID", "text", "正式流水线必填。", true],
@@ -49,7 +64,10 @@ const sectionDefinitions = [
     ],
   },
   {
+    key: "transcription",
+    icon: "04",
     title: "转写与纠正",
+    summary: "ASR 与领域词库",
     description: "语音识别并发、模型入口和领域词库。",
     fields: [
       ["asr.provider", "ASR 服务", "select", "默认使用火山引擎。", false, ["volcengine", "bailian"]],
@@ -63,7 +81,10 @@ const sectionDefinitions = [
     ],
   },
   {
+    key: "summary",
+    icon: "05",
     title: "内容总结",
+    summary: "模型与提示词",
     description: "OpenAI-compatible 模型生成归档卡片；API Key 仍从环境变量读取。",
     fields: [
       ["summary.enabled", "启用内容总结", "boolean", "模型和 API Key 都可用时才会执行。", true],
@@ -77,18 +98,48 @@ const sectionDefinitions = [
     ],
   },
   {
-    title: "备份与知识库",
-    description: "IMA、夸克和 Obsidian 独立执行，单路失败不影响其他目标。",
+    key: "backups",
+    icon: "06",
+    title: "备份策略",
+    summary: "并发与映射缓存",
+    description: "控制下游备份的并发量与达人目录映射缓存时间。",
     fields: [
       ["backups.max_workers", "备份并发数", "number", "最多并行执行的备份目标数。"],
       ["backups.mapping_cache_ttl_hours", "映射缓存时长（小时）", "number", "远端目录映射的缓存时间。"],
+    ],
+  },
+  {
+    key: "ima",
+    icon: "07",
+    title: "IMA 备份",
+    summary: "腾讯 IMA 知识库",
+    description: "管理 IMA 文案备份开关、达人映射文件和重名处理策略。",
+    fields: [
       ["ima.enabled", "启用 IMA", "boolean", "备份最终文案到腾讯 IMA。", true],
       ["ima.mapping", "IMA 映射文件", "text", "达人到知识库/文件夹的本地映射。"],
       ["ima.on_duplicate", "IMA 重名策略", "select", "日常任务推荐 skip。", false, ["skip", "fail", "rename"]],
+    ],
+  },
+  {
+    key: "kuake",
+    icon: "08",
+    title: "夸克网盘",
+    summary: "网盘文案备份",
+    description: "管理夸克备份开关、私有登录配置、CLI 和目标根目录。",
+    fields: [
       ["kuake.enabled", "启用夸克", "boolean", "备份最终文案到夸克网盘。", true],
       ["kuake.local_env", "夸克私有配置", "text", "Cookie 等凭据所在的 local 文件。"],
       ["kuake.kuake_exe", "夸克 CLI", "text", "本机 kuake 可执行文件路径。"],
       ["kuake.base_dir", "夸克根目录", "text", "留空时读取私有配置默认目录。"],
+    ],
+  },
+  {
+    key: "obsidian",
+    icon: "09",
+    title: "Obsidian",
+    summary: "本地知识库导出",
+    description: "管理本地知识库目录、笔记模板和按达人类型选择的总结提示词。",
+    fields: [
       ["obsidian.enabled", "启用 Obsidian", "boolean", "导出本地知识库笔记。", true],
       ["obsidian.original_dir", "Obsidian 达人根目录", "text", "每位达人会在这里使用独立子目录。", true],
       ["obsidian.template_file", "通用笔记模板", "text", "所有达人的基础笔记框架。", true],
@@ -110,7 +161,29 @@ const creatorFields = [
   ["media_output_dir", "MediaCrawler 输出目录", "text", "每位达人独立输出目录。"],
   ["correction_domain", "纠正领域", "text", "覆盖全局 correction.domain。"],
   ["summary_template_file", "专属总结提示词", "text", "优先级高于达人类型和全局模板。", true],
-  ["account_profiles", "专属账号池", "lines", "每行一个 profile；留空时使用全局账号池。", true],
+];
+
+const creatorCategoryDefinition = {
+  key: "creators",
+  icon: "10",
+  title: "达人信息",
+  summary: "统一达人模板",
+  description: "所有达人复用同一套信息模板，通过列表切换当前编辑对象。",
+};
+
+const accountCategoryDefinition = {
+  key: "accounts",
+  icon: "池",
+  title: "账号池管理",
+  summary: "扫码登录与 Profile",
+  description: "预先维护多个抖音账号槽位，逐个扫码登录并把登录态保存在本机独立 Profile 中。",
+};
+
+const configCategories = [
+  sectionDefinitions[0],
+  accountCategoryDefinition,
+  ...sectionDefinitions.slice(1),
+  creatorCategoryDefinition,
 ];
 
 function el(id) { return document.getElementById(id); }
@@ -282,56 +355,227 @@ function createField(definition, value, path, creatorKey = null) {
   return wrapper;
 }
 
-function renderCreatorCard(creator, index) {
-  const card = document.createElement("article"); card.className = "creator-card"; card.dataset.creatorCard = String(index);
-  const head = document.createElement("div"); head.className = "creator-card-head";
-  const title = document.createElement("div"); title.className = "creator-title";
-  const number = document.createElement("span"); number.className = "creator-index"; number.textContent = String(index + 1).padStart(2, "0");
-  const name = document.createElement("strong"); name.textContent = creator.creator_name || creator.key || "新达人";
-  title.append(number, name);
-  const actions = document.createElement("div"); actions.className = "creator-actions";
-  actions.append(createField(["enabled", "启用", "boolean", "是否参与每日任务"], creator.enabled !== false, "", "enabled"));
-  const remove = document.createElement("button"); remove.type = "button"; remove.className = "danger-link"; remove.textContent = "移除";
-  remove.addEventListener("click", () => {
-    if (!confirm(`确认从配置中移除「${creator.creator_name || creator.key || "该达人"}」？历史作品和飞书记录不会被删除。`)) return;
-    state.config.creators.splice(index, 1); markDirty(); renderConfig();
+function configSectionShell(definition) {
+  const section = document.createElement("section");
+  section.className = "config-section config-section-active";
+  const head = document.createElement("div"); head.className = "config-section-head config-section-titlebar";
+  const titleBlock = document.createElement("div");
+  const kicker = document.createElement("span"); kicker.className = "config-section-number"; kicker.textContent = definition.icon;
+  const heading = document.createElement("h2"); heading.textContent = definition.title;
+  const description = document.createElement("p"); description.textContent = definition.description;
+  titleBlock.append(kicker, heading, description); head.append(titleBlock); section.append(head);
+  return section;
+}
+
+function renderConfigCategoryNavigation() {
+  const nav = el("config-category-nav"); nav.replaceChildren();
+  configCategories.forEach((definition) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `config-category-button ${state.activeConfigCategory === definition.key ? "active" : ""}`;
+    button.dataset.configCategory = definition.key;
+    const number = document.createElement("span"); number.className = "config-category-number"; number.textContent = definition.icon;
+    const text = document.createElement("span");
+    const title = document.createElement("strong"); title.textContent = definition.title;
+    const summary = document.createElement("small");
+    summary.textContent = definition.key === "creators" ? `${state.config.creators.length} 位达人 · ${definition.summary}` : definition.summary;
+    text.append(title, summary); button.append(number, text);
+    button.addEventListener("click", () => switchConfigCategory(definition.key));
+    nav.append(button);
   });
-  actions.append(remove); head.append(title, actions); card.append(head);
-  const fields = document.createElement("div"); fields.className = "creator-fields";
-  creatorFields.forEach((definition) => fields.append(createField(definition, creator[definition[0]], "", definition[0])));
-  card.append(fields);
-  return card;
+}
+
+function renderStandardConfigSection(definition) {
+  const section = configSectionShell(definition);
+  const fields = document.createElement("div"); fields.className = "fields";
+  definition.fields.forEach((fieldDefinition) => {
+    fields.append(createField(fieldDefinition, getPath(state.config, fieldDefinition[0]), fieldDefinition[0]));
+  });
+  section.append(fields);
+  return section;
+}
+
+function accountStatusText(status) {
+  return ({
+    ready: "已保存登录态",
+    running: "等待扫码",
+    failed: "登录未完成",
+    missing: "尚未登录",
+  })[status] || "尚未登录";
+}
+
+function renderAccountPoolManager() {
+  const section = configSectionShell(accountCategoryDefinition);
+  section.classList.add("account-pool-section");
+  const body = document.createElement("div"); body.className = "account-pool-body";
+  const intro = document.createElement("div"); intro.className = "account-pool-intro";
+  const introText = document.createElement("div");
+  const introTitle = document.createElement("strong"); introTitle.textContent = "一个槽位对应一个独立浏览器 Profile";
+  const introDescription = document.createElement("p");
+  introDescription.textContent = "扫码完成后 Cookie 由 Chromium 保存在 MediaCrawler/browser_data，不进入项目配置和日志。状态仅表示检测到本地登录文件，不代表账号当前未被风控。";
+  introText.append(introTitle, introDescription);
+  const refresh = document.createElement("button"); refresh.type = "button"; refresh.className = "button secondary"; refresh.textContent = "刷新登录状态";
+  refresh.addEventListener("click", () => loadAccountPoolStatus(true));
+  intro.append(introText, refresh); body.append(intro);
+
+  const profiles = getPath(state.config, "collection.account_profiles") || [];
+  const statuses = new Map((state.accountPool.profiles || []).map((item) => [item.key, item]));
+  const list = document.createElement("div"); list.className = "account-pool-list";
+  profiles.forEach((profileKey, index) => {
+    const status = statuses.get(profileKey) || { status: "missing", updated_at: null };
+    const row = document.createElement("article"); row.className = "account-pool-row";
+    const identity = document.createElement("div"); identity.className = "account-pool-identity";
+    const number = document.createElement("span"); number.textContent = String(index + 1).padStart(2, "0");
+    const field = document.createElement("div"); field.className = "field";
+    const label = document.createElement("label"); label.textContent = "账号槽位名称";
+    const input = document.createElement("input"); input.type = "text"; input.value = profileKey; input.dataset.accountProfileIndex = String(index);
+    const help = document.createElement("small"); help.textContent = "稳定标识，例如 account-a；修改名称会创建新的 Profile。";
+    field.append(label, input, help); identity.append(number, field);
+
+    const stateBlock = document.createElement("div"); stateBlock.className = "account-pool-state";
+    const badge = document.createElement("span"); badge.className = `account-state-badge ${status.status}`; badge.textContent = accountStatusText(status.status);
+    const updated = document.createElement("small"); updated.textContent = status.updated_at ? `更新于 ${formatTime(status.updated_at)}` : "本机尚未检测到登录文件";
+    stateBlock.append(badge, updated);
+
+    const actions = document.createElement("div"); actions.className = "account-pool-actions";
+    const login = document.createElement("button"); login.type = "button"; login.className = "button primary";
+    login.textContent = status.status === "running" ? "等待扫码…" : status.status === "ready" ? "重新扫码登录" : "保存并扫码登录";
+    login.disabled = status.status === "running";
+    login.addEventListener("click", () => startAccountLogin(index));
+    const remove = document.createElement("button"); remove.type = "button"; remove.className = "danger-link"; remove.textContent = "移出账号池";
+    remove.addEventListener("click", () => {
+      try { syncVisibleConfigToState(); } catch (error) { showConfigInputError(error); return; }
+      state.config.collection.account_profiles.splice(index, 1);
+      markDirty(); renderConfig();
+      toast("已从账号池配置移除；本地登录 Profile 未删除");
+    });
+    actions.append(login, remove); row.append(identity, stateBlock, actions); list.append(row);
+  });
+  if (!profiles.length) {
+    const empty = document.createElement("div"); empty.className = "account-pool-empty";
+    const title = document.createElement("strong"); title.textContent = "账号池还是空的";
+    const text = document.createElement("p"); text.textContent = "先添加账号槽位，再逐个点击扫码登录。";
+    empty.append(title, text); list.append(empty);
+  }
+  body.append(list);
+  const add = document.createElement("button"); add.type = "button"; add.className = "add-creator account-add-button"; add.textContent = "+ 添加账号槽位";
+  add.addEventListener("click", () => {
+    try { syncVisibleConfigToState(); } catch (error) { showConfigInputError(error); return; }
+    if (!state.config.collection || typeof state.config.collection !== "object") state.config.collection = {};
+    if (!Array.isArray(state.config.collection.account_profiles)) state.config.collection.account_profiles = [];
+    let number = state.config.collection.account_profiles.length + 1;
+    let key = `account-${number}`;
+    while (state.config.collection.account_profiles.includes(key)) { number += 1; key = `account-${number}`; }
+    state.config.collection.account_profiles.push(key); markDirty(); renderConfig();
+  });
+  body.append(add); section.append(body); return section;
+}
+
+function createNewCreator() {
+  const number = state.config.creators.length + 1;
+  return {
+    key: `creator-${number}`,
+    enabled: true,
+    creator_url: "",
+    creator_name: "",
+    creator_dir_name: "",
+    works_table_id: "",
+    works_file: `runtime/creator-${number}-works-from-mediacrawler.json`,
+    profile_file: `runtime/profile-creator-${number}-update.json`,
+    media_output_dir: `runtime/mediacrawler-output-creator-${number}`,
+    correction_domain: getPath(state.config, "correction.domain") || "douyin_shop_ads",
+  };
+}
+
+function switchCreator(index) {
+  try {
+    syncVisibleConfigToState();
+  } catch (error) {
+    showConfigInputError(error);
+    return;
+  }
+  state.activeCreatorIndex = index;
+  renderConfig();
+}
+
+function renderCreatorEditor() {
+  const definition = creatorCategoryDefinition;
+  const section = configSectionShell(definition);
+  section.classList.add("creator-template-section");
+  const creators = state.config.creators;
+  state.activeCreatorIndex = Math.min(Math.max(state.activeCreatorIndex, 0), Math.max(creators.length - 1, 0));
+
+  const workspace = document.createElement("div"); workspace.className = "creator-template-workspace";
+  const selector = document.createElement("aside"); selector.className = "creator-selector";
+  const selectorHead = document.createElement("div"); selectorHead.className = "creator-selector-head";
+  const selectorTitle = document.createElement("strong"); selectorTitle.textContent = "达人列表";
+  const selectorCount = document.createElement("span"); selectorCount.textContent = `${creators.length} 位`;
+  selectorHead.append(selectorTitle, selectorCount); selector.append(selectorHead);
+
+  const selectorList = document.createElement("div"); selectorList.className = "creator-selector-list";
+  creators.forEach((creator, index) => {
+    const button = document.createElement("button"); button.type = "button";
+    button.className = `creator-selector-item ${index === state.activeCreatorIndex ? "active" : ""}`;
+    const avatar = document.createElement("span"); avatar.textContent = String(index + 1).padStart(2, "0");
+    const text = document.createElement("span");
+    const name = document.createElement("strong"); name.textContent = creator.creator_name || creator.key || "未命名达人";
+    const key = document.createElement("small"); key.textContent = creator.key || "待填写 Key";
+    text.append(name, key); button.append(avatar, text);
+    button.addEventListener("click", () => switchCreator(index)); selectorList.append(button);
+  });
+  selector.append(selectorList);
+  const add = document.createElement("button"); add.type = "button"; add.className = "add-creator"; add.textContent = "+ 添加达人";
+  add.addEventListener("click", () => {
+    try { syncVisibleConfigToState(); } catch (error) { showConfigInputError(error); return; }
+    state.config.creators.push(createNewCreator());
+    state.activeCreatorIndex = state.config.creators.length - 1;
+    markDirty(); renderConfig();
+  });
+  selector.append(add); workspace.append(selector);
+
+  const editor = document.createElement("div"); editor.className = "creator-template-editor";
+  if (!creators.length) {
+    const empty = document.createElement("div"); empty.className = "creator-template-empty";
+    const heading = document.createElement("strong"); heading.textContent = "还没有达人配置";
+    const text = document.createElement("p"); text.textContent = "点击左侧“添加达人”，使用统一信息模板录入第一位达人。";
+    empty.append(heading, text); editor.append(empty);
+  } else {
+    const creator = creators[state.activeCreatorIndex];
+    editor.dataset.creatorEditor = String(state.activeCreatorIndex);
+    const editorHead = document.createElement("div"); editorHead.className = "creator-template-editor-head";
+    const editorTitle = document.createElement("div");
+    const heading = document.createElement("strong"); heading.textContent = creator.creator_name || creator.key || "未命名达人";
+    const hint = document.createElement("small"); hint.textContent = "使用统一达人信息模板编辑当前对象";
+    editorTitle.append(heading, hint);
+    const actions = document.createElement("div"); actions.className = "creator-actions";
+    actions.append(createField(["enabled", "启用", "boolean", "是否参与每日任务"], creator.enabled !== false, "", "enabled"));
+    const remove = document.createElement("button"); remove.type = "button"; remove.className = "danger-link"; remove.textContent = "移除达人";
+    remove.addEventListener("click", () => {
+      try { syncVisibleConfigToState(); } catch (error) { showConfigInputError(error); return; }
+      const current = state.config.creators[state.activeCreatorIndex];
+      if (!confirm(`确认从配置中移除「${current.creator_name || current.key || "该达人"}」？历史作品和飞书记录不会被删除。`)) return;
+      state.config.creators.splice(state.activeCreatorIndex, 1);
+      state.activeCreatorIndex = Math.min(state.activeCreatorIndex, Math.max(state.config.creators.length - 1, 0));
+      markDirty(); renderConfig();
+    });
+    actions.append(remove); editorHead.append(editorTitle, actions); editor.append(editorHead);
+    const fields = document.createElement("div"); fields.className = "creator-fields creator-template-fields";
+    creatorFields.forEach((fieldDefinition) => {
+      fields.append(createField(fieldDefinition, creator[fieldDefinition[0]], "", fieldDefinition[0]));
+    });
+    editor.append(fields);
+  }
+  workspace.append(editor); section.append(workspace);
+  return section;
 }
 
 function renderConfig() {
-  const form = el("config-form"); form.replaceChildren();
-  const grid = document.createElement("div"); grid.className = "config-grid";
-  sectionDefinitions.forEach((sectionDefinition) => {
-    const section = document.createElement("section"); section.className = "config-section";
-    const head = document.createElement("div"); head.className = "config-section-head";
-    const heading = document.createElement("h2"); heading.textContent = sectionDefinition.title;
-    const description = document.createElement("p"); description.textContent = sectionDefinition.description;
-    head.append(heading, description);
-    const fields = document.createElement("div"); fields.className = "fields";
-    sectionDefinition.fields.forEach((definition) => fields.append(createField(definition, getPath(state.config, definition[0]), definition[0])));
-    section.append(head, fields); grid.append(section);
-  });
-
-  const creatorsSection = document.createElement("section"); creatorsSection.className = "config-section full";
-  const creatorHead = document.createElement("div"); creatorHead.className = "config-section-head";
-  const creatorHeading = document.createElement("h2"); creatorHeading.textContent = `达人配置（${state.config.creators.length}）`;
-  const creatorDescription = document.createElement("p"); creatorDescription.textContent = "每位达人使用独立作品表与本地产物目录；移除配置不会删除任何历史记录。";
-  creatorHead.append(creatorHeading, creatorDescription);
-  const list = document.createElement("div"); list.className = "creator-list";
-  state.config.creators.forEach((creator, index) => list.append(renderCreatorCard(creator, index)));
-  const add = document.createElement("button"); add.type = "button"; add.className = "add-creator"; add.textContent = "+ 添加达人";
-  add.addEventListener("click", () => {
-    const number = state.config.creators.length + 1;
-    state.config.creators.push({ key: `creator-${number}`, enabled: true, creator_url: "", creator_name: "", creator_dir_name: "", works_table_id: "", works_file: `runtime/creator-${number}-works-from-mediacrawler.json`, profile_file: `runtime/profile-creator-${number}-update.json`, media_output_dir: `runtime/mediacrawler-output-creator-${number}`, correction_domain: getPath(state.config, "correction.domain") || "douyin_shop_ads" });
-    markDirty(); renderConfig();
-  });
-  list.append(add); creatorsSection.append(creatorHead, list); grid.append(creatorsSection);
-  form.append(grid);
+  renderConfigCategoryNavigation();
+  const content = el("config-category-content"); content.replaceChildren();
+  const definition = configCategories.find((item) => item.key === state.activeConfigCategory) || sectionDefinitions[0];
+  if (definition.key === "creators") content.append(renderCreatorEditor());
+  else if (definition.key === "accounts") content.append(renderAccountPoolManager());
+  else content.append(renderStandardConfigSection(definition));
 }
 
 function readInput(input) {
@@ -354,15 +598,45 @@ function readInput(input) {
   return input.value.trim();
 }
 
-function collectConfig() {
-  const config = deepClone(state.config);
-  document.querySelectorAll("#config-form [data-path]").forEach((input) => setPath(config, input.dataset.path, readInput(input)));
-  config.creators = [...document.querySelectorAll("[data-creator-card]")].map((card, index) => {
-    const creator = deepClone(state.config.creators[index] || {});
-    card.querySelectorAll("[data-creator-key]").forEach((input) => { creator[input.dataset.creatorKey] = readInput(input); });
-    return creator;
+function showConfigInputError(error) {
+  const notice = el("config-notice"); notice.textContent = error.message; notice.className = "notice";
+  toast(error.message, "error");
+}
+
+function syncVisibleConfigToState() {
+  document.querySelectorAll("#config-form [data-path]").forEach((input) => {
+    setPath(state.config, input.dataset.path, readInput(input));
   });
-  return config;
+  const creatorEditor = document.querySelector("[data-creator-editor]");
+  if (creatorEditor) {
+    const index = Number(creatorEditor.dataset.creatorEditor);
+    const creator = state.config.creators[index];
+    creatorEditor.querySelectorAll("[data-creator-key]").forEach((input) => {
+      creator[input.dataset.creatorKey] = readInput(input);
+    });
+  }
+  const accountInputs = [...document.querySelectorAll("[data-account-profile-index]")];
+  if (accountInputs.length) {
+    if (!state.config.collection || typeof state.config.collection !== "object") state.config.collection = {};
+    state.config.collection.account_profiles = accountInputs.map((input) => input.value.trim());
+  }
+}
+
+function collectConfig() {
+  syncVisibleConfigToState();
+  return deepClone(state.config);
+}
+
+function switchConfigCategory(categoryKey) {
+  if (state.activeConfigCategory === categoryKey) return;
+  try {
+    syncVisibleConfigToState();
+  } catch (error) {
+    showConfigInputError(error);
+    return;
+  }
+  state.activeConfigCategory = categoryKey;
+  renderConfig();
 }
 
 function markDirty() {
@@ -375,13 +649,46 @@ function markClean() {
   el("unsaved-badge").classList.add("hidden");
 }
 
+async function loadAccountPoolStatus(showFeedback = false) {
+  try {
+    state.accountPool = await api("/api/accounts");
+    if (state.activeConfigCategory === "accounts" && !state.dirty && state.config) renderConfig();
+    if (showFeedback) toast("账号池状态已刷新");
+  } catch (error) {
+    if (showFeedback) toast(error.message, "error");
+  }
+}
+
+async function startAccountLogin(index) {
+  try {
+    const config = collectConfig();
+    const profileKey = config.collection.account_profiles[index];
+    if (!profileKey) throw new Error("账号槽位名称不能为空");
+    const saved = await api("/api/config", { method: "PUT", body: JSON.stringify(config) });
+    state.config = saved.config; markClean();
+    const result = await api("/api/accounts/login", {
+      method: "POST",
+      body: JSON.stringify({ profile_key: profileKey }),
+    });
+    toast(result.message || "扫码登录窗口已打开");
+    await loadAccountPoolStatus(false);
+    renderConfig();
+  } catch (error) {
+    showConfigInputError(error);
+  }
+}
+
 async function loadConfig(showFeedback = false) {
   try {
     const payload = await api("/api/config");
     state.config = payload.config;
     if (!Array.isArray(state.config.creators)) state.config.creators = [];
+    if (!state.config.collection || typeof state.config.collection !== "object") state.config.collection = {};
+    if (!Array.isArray(state.config.collection.account_profiles)) state.config.collection.account_profiles = [];
     el("config-path").textContent = payload.path;
-    renderConfig(); markClean();
+    markClean();
+    await loadAccountPoolStatus(false);
+    renderConfig();
     const notice = el("config-notice");
     if (!payload.exists) {
       notice.textContent = "本机配置尚不存在，当前显示的是模板。首次保存会创建 local/pipeline.json。";
@@ -444,3 +751,8 @@ window.addEventListener("beforeunload", (event) => {
 loadStatus(false);
 loadConfig(false);
 setInterval(() => { if (state.activeTab === "overview") loadStatus(false); }, 12_000);
+setInterval(() => {
+  if (state.activeTab === "config" && state.activeConfigCategory === "accounts" && !state.dirty) {
+    loadAccountPoolStatus(false);
+  }
+}, 3_000);

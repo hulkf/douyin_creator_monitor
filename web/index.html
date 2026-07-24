@@ -158,9 +158,20 @@
             </div>
           </div>
           <div class="notice hidden" id="config-notice" role="status"></div>
-          <form id="config-form" autocomplete="off">
-            <div class="config-loading">正在加载配置…</div>
-          </form>
+          <div class="config-workspace">
+            <aside class="config-category-sidebar">
+              <div class="config-category-heading">
+                <p>CONFIGURATION</p>
+                <strong>配置栏目</strong>
+              </div>
+              <nav id="config-category-nav" aria-label="配置栏目"></nav>
+            </aside>
+            <form id="config-form" autocomplete="off">
+              <div id="config-category-content">
+                <div class="config-loading">正在加载配置…</div>
+              </div>
+            </form>
+          </div>
         </section>
       </main>
     </div>

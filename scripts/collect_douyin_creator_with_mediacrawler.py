@@ -16,6 +16,7 @@ The script does not vendor MediaCrawler. Point ``--media-crawler-dir`` or the
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import csv
 import json
 import os
@@ -120,6 +121,51 @@ def safe_browser_profile_key(value: str) -> str:
     normalized = "".join(char if char.isalnum() or char in "-_." else "_" for char in value.strip())
     normalized = normalized.strip(" ._")
     return normalized if normalized not in {"", ".", ".."} else "creator"
+
+
+@contextmanager
+def browser_profile_lock(media_dir: Path, browser_profile_key: str):
+    """Prevent two collectors from opening the same persistent Chromium profile."""
+
+    lock_dir = media_dir / "browser_data"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / f".{safe_browser_profile_key(browser_profile_key)}.profile.lock"
+    handle = lock_path.open("a+b")
+    handle.seek(0, os.SEEK_END)
+    if handle.tell() == 0:
+        handle.write(b"0")
+        handle.flush()
+    handle.seek(0)
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        handle.close()
+        raise SystemExit(
+            f"Browser profile {browser_profile_key!r} is already in use; "
+            "wait for the current collection or login to finish."
+        ) from exc
+    try:
+        yield lock_path
+    finally:
+        try:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
 
 
 def cleanup_mediacrawler_chrome(browser_profile_key: str, cdp_port: int) -> list[int]:
@@ -804,6 +850,7 @@ def run_mediacrawler(
                 "import asyncio, ctypes, json, os, runpy, subprocess, sys, time",
                 f"INTERACTIVE_LOGIN_EXIT_CODE = {INTERACTIVE_LOGIN_EXIT_CODE}",
                 f"interactive_login = os.environ.get({INTERACTIVE_LOGIN_ENV!r}) == '1'",
+                f"login_only = {bool(getattr(args, 'login_only', False))!r}",
                 "def _visible_blank_chrome_windows():",
                 "    if os.name != 'nt':",
                 "        return set()",
@@ -899,6 +946,11 @@ def run_mediacrawler(
                 "            await self.context_page.wait_for_load_state('domcontentloaded', timeout=30000)",
                 "            await asyncio.sleep(1)",
                 "DouYinCrawler.create_douyin_client = _create_douyin_client_with_navigation_retry",
+                "if login_only:",
+                "    async def _skip_creator_collection_after_login(self):",
+                "        print('[collector] login profile is ready; skipping creator collection')",
+                "        return None",
+                "    DouYinCrawler.get_creators_and_videos = _skip_creator_collection_after_login",
                 "_original_get_aweme_detail = DouYinCrawler.get_aweme_detail",
                 "async def _get_aweme_detail_with_network_retry(self, aweme_id, semaphore):",
                 "    for attempt in range(3):",
@@ -1001,22 +1053,23 @@ def run_mediacrawler(
     command = build_mediacrawler_command(media_dir, args.media_crawler_python, bootstrap)
     run_env = os.environ.copy()
     run_env.pop(INTERACTIVE_LOGIN_ENV, None)
-    try:
-        result = subprocess.run(
-            command, cwd=media_dir, env=run_env, text=True, encoding="utf-8", errors="replace",
-        )
-        if result.returncode == INTERACTIVE_LOGIN_EXIT_CODE:
-            cleanup_mediacrawler_chrome(browser_profile_key, cdp_port)
-            print(
-                f"[collector] Douyin login is required for profile={browser_profile_key}; "
-                "opening one visible browser for manual login"
-            )
-            run_env[INTERACTIVE_LOGIN_ENV] = "1"
+    with browser_profile_lock(media_dir, browser_profile_key):
+        try:
             result = subprocess.run(
                 command, cwd=media_dir, env=run_env, text=True, encoding="utf-8", errors="replace",
             )
-    finally:
-        cleanup_mediacrawler_chrome(browser_profile_key, cdp_port)
+            if result.returncode == INTERACTIVE_LOGIN_EXIT_CODE:
+                cleanup_mediacrawler_chrome(browser_profile_key, cdp_port)
+                print(
+                    f"[collector] Douyin login is required for profile={browser_profile_key}; "
+                    "opening one visible browser for manual login"
+                )
+                run_env[INTERACTIVE_LOGIN_ENV] = "1"
+                result = subprocess.run(
+                    command, cwd=media_dir, env=run_env, text=True, encoding="utf-8", errors="replace",
+                )
+        finally:
+            cleanup_mediacrawler_chrome(browser_profile_key, cdp_port)
     if result.returncode != 0:
         raise SystemExit(result.returncode)
     report = read_existing_payload(report_file) if report_file.exists() else {
@@ -1165,11 +1218,23 @@ def main() -> int:
     parser.add_argument("--save-data-option", default="jsonl", choices=["jsonl", "json", "csv"])
     parser.add_argument("--normalize-only", action="store_true", help="Skip running MediaCrawler; only normalize existing output files.")
     parser.add_argument("--clean-media-output", action="store_true")
+    parser.add_argument(
+        "--login-only",
+        action="store_true",
+        help="Open the selected persistent browser profile for login without collecting creator works.",
+    )
     args = parser.parse_args()
     if args.incremental_probe_count < 1:
         parser.error("--incremental-probe-count must be at least 1")
     if not 1 <= args.cdp_port <= 65535:
         parser.error("--cdp-port must be between 1 and 65535")
+    if args.login_only:
+        run_mediacrawler(args, mode="login_only", known_ids=set())
+        print(json.dumps({
+            "status": "login_ready",
+            "browser_profile_key": args.browser_profile_key,
+        }, ensure_ascii=False, indent=2))
+        return 0
     payload = collect(args)
     profile_update = payload.get("profile_update") or {}
     print(json.dumps({

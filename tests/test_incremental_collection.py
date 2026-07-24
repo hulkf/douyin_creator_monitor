@@ -415,6 +415,16 @@ class IncrementalCollectionTest(unittest.TestCase):
 
             cleanup.assert_called_once_with("creator-a", 9222)
 
+    def test_browser_profile_lock_rejects_a_second_user_of_the_same_profile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            media = Path(directory) / "MediaCrawler"
+            media.mkdir()
+
+            with COLLECTOR.browser_profile_lock(media, "account-a"):
+                with self.assertRaises(SystemExit):
+                    with COLLECTOR.browser_profile_lock(media, "account-a"):
+                        pass
+
     def test_mediacrawler_reopens_visibly_only_when_login_is_required(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

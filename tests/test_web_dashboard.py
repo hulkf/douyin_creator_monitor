@@ -114,6 +114,68 @@ class WebDashboardConfigTests(unittest.TestCase):
             self.assertEqual(result.path, path)
             self.assertEqual(result.backup_path, backup)
 
+    def test_account_pool_status_detects_persisted_profile_cookie(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "config").mkdir()
+            (root / "local").mkdir()
+            config = valid_config()
+            config["collection"] = {
+                "account_profiles": ["account-a", "account-b"],
+                "media_crawler_dir": "MediaCrawler",
+            }
+            (root / "config" / "pipeline.example.json").write_text(
+                json.dumps(config), encoding="utf-8"
+            )
+            (root / "local" / "pipeline.json").write_text(
+                json.dumps(config), encoding="utf-8"
+            )
+            cookie = (
+                root
+                / "MediaCrawler"
+                / "browser_data"
+                / "cdp_account-a_dy_user_data_dir"
+                / "Default"
+                / "Network"
+                / "Cookies"
+            )
+            cookie.parent.mkdir(parents=True)
+            cookie.write_bytes(b"x" * WEB.GUI.VALID_LOGIN_MIN_BYTES)
+
+            payload = WEB.account_pool_payload(root)
+
+            self.assertEqual(payload["profiles"][0]["status"], "ready")
+            self.assertEqual(payload["profiles"][1]["status"], "missing")
+
+    def test_account_login_command_is_isolated_to_selected_profile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "runtime").mkdir()
+            config = valid_config()
+            config["collection"] = {
+                "account_profiles": ["account-a", "account-b"],
+                "media_crawler_dir": "D:/MediaCrawler",
+                "media_crawler_python": "D:/MediaCrawler/.venv/Scripts/python.exe",
+                "cdp_port_start": 9222,
+                "cdp_port_stride": 10,
+            }
+
+            command = WEB.build_account_login_command(root, config, "account-b")
+
+            self.assertIn("--browser-profile-key", command)
+            self.assertEqual(command[command.index("--browser-profile-key") + 1], "account-b")
+            self.assertEqual(command[command.index("--cdp-port") + 1], "9232")
+            self.assertIn("--login-only", command)
+
+    def test_account_login_is_reported_as_active_while_process_is_running(self):
+        process = Mock()
+        process.poll.return_value = None
+        WEB._ACCOUNT_LOGIN_PROCESSES["account-a"] = process
+        try:
+            self.assertEqual(WEB.active_account_login_keys(), ["account-a"])
+        finally:
+            WEB._ACCOUNT_LOGIN_PROCESSES.clear()
+
 
 class WebDashboardPayloadTests(unittest.TestCase):
     def test_snapshot_payload_converts_dates_and_paths_for_json(self):
@@ -142,6 +204,18 @@ class WebDashboardPayloadTests(unittest.TestCase):
         json.dumps(payload)
 
 
+class WebDashboardStaticTests(unittest.TestCase):
+    def test_config_page_uses_category_navigation_and_one_content_panel(self):
+        project_dir = Path(__file__).resolve().parents[1]
+        html = (project_dir / "web" / "index.html").read_text(encoding="utf-8")
+        javascript = (project_dir / "web" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn('id="config-category-nav"', html)
+        self.assertIn('id="config-category-content"', html)
+        self.assertIn("function switchConfigCategory", javascript)
+        self.assertIn("function syncVisibleConfigToState", javascript)
+
+
 class WebDashboardHttpTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -158,10 +232,14 @@ class WebDashboardHttpTests(unittest.TestCase):
         (self.root / "web" / "index.html").write_text("<h1>dashboard</h1>", encoding="utf-8")
         self.snapshot_builder = Mock(side_effect=RuntimeError("status unavailable in test"))
         self.task_starter = Mock(return_value="started")
+        self.account_status_provider = Mock(return_value={"profiles": []})
+        self.account_login_starter = Mock(return_value={"message": "login started"})
         handler = WEB.make_handler(
             self.root,
             snapshot_builder=self.snapshot_builder,
             task_starter=self.task_starter,
+            account_status_provider=self.account_status_provider,
+            account_login_starter=self.account_login_starter,
         )
         self.server = WEB.ThreadingHTTPServer(("127.0.0.1", 0), handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -208,6 +286,17 @@ class WebDashboardHttpTests(unittest.TestCase):
         self.assertEqual(status, 202)
         self.assertEqual(payload["message"], "started")
         self.task_starter.assert_called_once_with(WEB.GUI.TASK_NAME)
+
+    def test_account_login_api_starts_selected_profile(self):
+        status, payload = self.request(
+            "/api/accounts/login",
+            method="POST",
+            payload={"profile_key": "account-a"},
+        )
+
+        self.assertEqual(status, 202)
+        self.assertEqual(payload["message"], "login started")
+        self.account_login_starter.assert_called_once_with("account-a", self.root)
 
     def test_invalid_config_returns_400_without_overwriting_file(self):
         before = (self.root / "local" / "pipeline.json").read_text(encoding="utf-8")

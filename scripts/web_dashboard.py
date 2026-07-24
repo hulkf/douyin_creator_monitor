@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -35,6 +36,8 @@ WEB_DIR_RELATIVE_PATH = Path("web")
 MAX_REQUEST_BYTES = 2 * 1024 * 1024
 CREATOR_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 _CONFIG_LOCK = threading.Lock()
+_ACCOUNT_LOGIN_LOCK = threading.Lock()
+_ACCOUNT_LOGIN_PROCESSES: dict[str, subprocess.Popen[Any]] = {}
 
 
 class WebDashboardError(RuntimeError):
@@ -192,6 +195,10 @@ def validate_pipeline_config(config: Any) -> list[str]:
     profiles = collection.get("account_profiles", [])
     if not isinstance(profiles, list) or any(not isinstance(item, str) for item in profiles):
         errors.append("collection.account_profiles 必须是字符串数组")
+    elif any(not item.strip() or not CREATOR_KEY_PATTERN.fullmatch(item.strip()) for item in profiles):
+        errors.append("collection.account_profiles 只能包含非空的字母、数字、下划线和连字符")
+    elif len({item.strip() for item in profiles}) != len(profiles):
+        errors.append("collection.account_profiles 不能包含重复账号槽位")
 
     feishu = _require_object(config, "feishu", errors)
     _check_required_text(feishu, "creator_table_id", "feishu.creator_table_id", errors)
@@ -349,11 +356,174 @@ def snapshot_payload(snapshot: GUI.DashboardSnapshot) -> dict[str, Any]:
     }
 
 
+def _account_profile_keys(config: dict[str, Any]) -> list[str]:
+    collection = config.get("collection")
+    collection = collection if isinstance(collection, dict) else {}
+    result: list[str] = []
+    for value in collection.get("account_profiles", []):
+        key = str(value or "").strip()
+        if key and key not in result:
+            result.append(key)
+    return result
+
+
+def _account_cookie_file(project_dir: Path, config: dict[str, Any], profile_key: str) -> Path:
+    collection = config.get("collection")
+    collection = collection if isinstance(collection, dict) else {}
+    media_crawler_dir = GUI.project_path(
+        project_dir,
+        collection.get("media_crawler_dir"),
+        project_dir / "MediaCrawler",
+    )
+    return (
+        media_crawler_dir
+        / "browser_data"
+        / f"cdp_{profile_key}_dy_user_data_dir"
+        / "Default"
+        / "Network"
+        / "Cookies"
+    )
+
+
+def account_pool_payload(project_dir: Path = PROJECT_DIR) -> dict[str, Any]:
+    project_dir = project_dir.resolve()
+    loaded = load_pipeline_config(project_dir)
+    profiles: list[dict[str, Any]] = []
+    with _ACCOUNT_LOGIN_LOCK:
+        for key in _account_profile_keys(loaded.config):
+            process = _ACCOUNT_LOGIN_PROCESSES.get(key)
+            return_code = process.poll() if process is not None else None
+            running = process is not None and return_code is None
+            cookie_file = _account_cookie_file(project_dir, loaded.config, key)
+            try:
+                stat = cookie_file.stat()
+                ready = stat.st_size >= GUI.VALID_LOGIN_MIN_BYTES
+                updated_at = datetime.fromtimestamp(stat.st_mtime).astimezone().isoformat()
+            except OSError:
+                ready = False
+                updated_at = None
+            if running:
+                status = "running"
+            elif ready:
+                status = "ready"
+            elif process is not None and return_code not in (None, 0):
+                status = "failed"
+            else:
+                status = "missing"
+            profiles.append(
+                {
+                    "key": key,
+                    "status": status,
+                    "updated_at": updated_at,
+                    "profile_dir": str(cookie_file.parents[2]),
+                }
+            )
+            if process is not None and return_code is not None:
+                _ACCOUNT_LOGIN_PROCESSES.pop(key, None)
+    return {"profiles": profiles, "configured_count": len(profiles)}
+
+
+def build_account_login_command(
+    project_dir: Path,
+    config: dict[str, Any],
+    profile_key: str,
+) -> list[str]:
+    profile_key = str(profile_key or "").strip()
+    if not CREATOR_KEY_PATTERN.fullmatch(profile_key):
+        raise WebDashboardError("账号槽位只能包含字母、数字、下划线和连字符")
+    keys = _account_profile_keys(config)
+    if profile_key not in keys:
+        raise WebDashboardError(f"账号槽位尚未保存到配置：{profile_key}")
+    collection = config.get("collection")
+    collection = collection if isinstance(collection, dict) else {}
+    try:
+        port_start = int(collection.get("cdp_port_start", 9222))
+        port_stride = int(collection.get("cdp_port_stride", 10))
+    except (TypeError, ValueError) as exc:
+        raise WebDashboardError("账号池 CDP 端口配置无效") from exc
+    cdp_port = port_start + keys.index(profile_key) * port_stride
+    if not 1 <= cdp_port <= 65535:
+        raise WebDashboardError(f"账号槽位 {profile_key} 的 CDP 端口超出范围")
+    login_dir = project_dir / "runtime" / "account-login" / profile_key
+    command = [
+        str(config.get("python") or sys.executable),
+        str(project_dir / "scripts" / "collect_douyin_creator_with_mediacrawler.py"),
+        "--creator-url",
+        "https://www.douyin.com/user/account-login-probe",
+        "--media-output-dir",
+        str(login_dir / "output"),
+        "--output-file",
+        str(login_dir / "probe.json"),
+        "--max-count",
+        "1",
+        "--expect-min-count",
+        "0",
+        "--login-type",
+        "qrcode",
+        "--browser-profile-key",
+        profile_key,
+        "--cdp-port",
+        str(cdp_port),
+        "--login-only",
+    ]
+    for option, value in (
+        ("--media-crawler-dir", collection.get("media_crawler_dir")),
+        ("--media-crawler-python", collection.get("media_crawler_python")),
+    ):
+        if str(value or "").strip():
+            command.extend([option, str(value).strip()])
+    return command
+
+
+def start_account_login(profile_key: str, project_dir: Path = PROJECT_DIR) -> dict[str, Any]:
+    project_dir = project_dir.resolve()
+    try:
+        task = GUI.query_scheduled_task(GUI.TASK_NAME)
+    except GUI.DashboardError:
+        task = None
+    if task is not None and task.state.casefold() == "running":
+        raise WebDashboardError("每日流水线正在运行，请等待采集结束后再扫码登录")
+    config = load_pipeline_config(project_dir).config
+    command = build_account_login_command(project_dir, config, profile_key)
+    with _ACCOUNT_LOGIN_LOCK:
+        current = _ACCOUNT_LOGIN_PROCESSES.get(profile_key)
+        if current is not None and current.poll() is None:
+            raise WebDashboardError(f"账号槽位 {profile_key} 正在等待扫码")
+        options: dict[str, Any] = {
+            "cwd": project_dir,
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+        }
+        if os.name == "nt":
+            options["creationflags"] = subprocess.CREATE_NO_WINDOW
+        try:
+            process = subprocess.Popen(command, **options)
+        except OSError as exc:
+            raise WebDashboardError(f"无法启动账号槽位 {profile_key} 的扫码登录：{exc}") from exc
+        _ACCOUNT_LOGIN_PROCESSES[profile_key] = process
+    return {
+        "message": f"已打开账号槽位 {profile_key} 的抖音扫码窗口",
+        "profile_key": profile_key,
+    }
+
+
+def active_account_login_keys() -> list[str]:
+    with _ACCOUNT_LOGIN_LOCK:
+        return [
+            key
+            for key, process in _ACCOUNT_LOGIN_PROCESSES.items()
+            if process.poll() is None
+        ]
+
+
 def make_handler(
     project_dir: Path = PROJECT_DIR,
     *,
     snapshot_builder: Callable[..., GUI.DashboardSnapshot] = GUI.build_dashboard_snapshot,
     task_starter: Callable[[str], str] = GUI.start_scheduled_task,
+    account_status_provider: Callable[[Path], dict[str, Any]] = account_pool_payload,
+    account_login_starter: Callable[[str, Path], dict[str, Any]] = start_account_login,
 ) -> type[BaseHTTPRequestHandler]:
     project_dir = project_dir.resolve()
     web_dir = project_dir / WEB_DIR_RELATIVE_PATH
@@ -437,6 +607,8 @@ def make_handler(
                     )
                 elif path == "/api/status":
                     self._json(HTTPStatus.OK, snapshot_payload(snapshot_builder(project_dir)))
+                elif path == "/api/accounts":
+                    self._json(HTTPStatus.OK, account_status_provider(project_dir))
                 elif path.startswith("/api/"):
                     self._error(HTTPStatus.NOT_FOUND, "接口不存在")
                 else:
@@ -470,11 +642,27 @@ def make_handler(
                 self._error(HTTPStatus.INTERNAL_SERVER_ERROR, f"保存失败：{exc}")
 
         def do_POST(self) -> None:  # noqa: N802
-            if urlsplit(self.path).path != "/api/run":
+            path = urlsplit(self.path).path
+            if path == "/api/accounts/login":
+                try:
+                    payload = self._read_json()
+                    profile_key = str(payload.get("profile_key") or "") if isinstance(payload, dict) else ""
+                    self._json(HTTPStatus.ACCEPTED, account_login_starter(profile_key, project_dir))
+                except WebDashboardError as exc:
+                    self._error(HTTPStatus.BAD_REQUEST, str(exc))
+                except Exception as exc:
+                    self._error(HTTPStatus.INTERNAL_SERVER_ERROR, f"账号登录启动失败：{exc}")
+                return
+            if path != "/api/run":
                 self._error(HTTPStatus.NOT_FOUND, "接口不存在")
                 return
             try:
                 self._read_json()
+                active_logins = active_account_login_keys()
+                if active_logins:
+                    raise WebDashboardError(
+                        f"账号槽位 {', '.join(active_logins)} 正在等待扫码，请先完成或关闭登录窗口"
+                    )
                 message = task_starter(GUI.TASK_NAME)
                 self._json(HTTPStatus.ACCEPTED, {"message": message})
             except WebDashboardError as exc:
