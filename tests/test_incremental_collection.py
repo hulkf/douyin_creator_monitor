@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 from pathlib import Path
+from types import SimpleNamespace
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "collect_douyin_creator_with_mediacrawler.py"
 SPEC = importlib.util.spec_from_file_location("incremental_collector", MODULE_PATH)
@@ -22,6 +23,42 @@ class IncrementalCollectionTest(unittest.TestCase):
             {"aweme_id": work_id, "create_time": 100 - index}
             for index, work_id in enumerate(ids)
         ]
+
+    def test_visible_browser_bootstrap_applies_configured_small_window(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_dir = root / "MediaCrawler"
+            media_dir.mkdir()
+            (media_dir / "main.py").write_text("", encoding="utf-8")
+            args = SimpleNamespace(
+                media_crawler_dir=str(media_dir),
+                media_crawler_python=None,
+                media_output_dir=str(root / "output"),
+                clean_media_output=False,
+                creator_url="creator-id",
+                min_publish_date=None,
+                browser_profile_key="demo",
+                cdp_port=9222,
+                headless=False,
+                browser_window_width=420,
+                browser_window_height=280,
+                login_only=False,
+                login_type="qrcode",
+                incremental_probe_count=3,
+                max_count=10,
+                save_data_option="jsonl",
+            )
+            with patch.object(
+                COLLECTOR.subprocess,
+                "run",
+                return_value=SimpleNamespace(returncode=0),
+            ), patch.object(COLLECTOR, "cleanup_mediacrawler_chrome"):
+                output_dir, _ = COLLECTOR.run_mediacrawler(args, mode="incremental", known_ids=set())
+
+            bootstrap = (output_dir / "_run_mediacrawler_douyin_creator.py").read_text(encoding="utf-8")
+            self.assertIn("--window-size={window_width},{window_height}", bootstrap)
+            self.assertIn("window_width = 420", bootstrap)
+            self.assertIn("window_height = 280", bootstrap)
 
     def test_known_first_work_still_probes_three_then_stops(self):
         selected, checked, stopped, boundary = COLLECTOR.select_incremental_page(
@@ -360,7 +397,7 @@ class IncrementalCollectionTest(unittest.TestCase):
             self.assertTrue(all("config.CDP_HEADLESS = requested_headless and not interactive_login" in text for text in bootstrap_texts))
             self.assertTrue(all("'--headless', 'true' if requested_headless and not interactive_login else 'false'" in text for text in bootstrap_texts))
             self.assertTrue(all("--no-startup-window" in text for text in bootstrap_texts))
-            self.assertTrue(all("_close_new_blank_chrome_windows" in text for text in bootstrap_texts))
+            self.assertTrue(all("_close_new_blank_chrome_windows" not in text for text in bootstrap_texts))
             self.assertTrue(all("subprocess.CREATE_NO_WINDOW" in text for text in bootstrap_texts))
             self.assertTrue(all("INTERACTIVE_LOGIN_EXIT_CODE" in text for text in bootstrap_texts))
             self.assertTrue(all("kwargs.setdefault('wait_until', 'domcontentloaded')" in text for text in bootstrap_texts))

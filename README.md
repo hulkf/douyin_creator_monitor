@@ -346,6 +346,7 @@ python .\scripts\run_creator_pipeline.py --creator aligc --feishu-only
 - 每个达人使用独立的 MediaCrawler 输出目录、采集状态、运行 bootstrap 和持久化浏览器 profile，避免并发时配置、产物或 Chromium profile 锁互相冲突；首次创建新 profile 时可能需要重新确认登录授权。
 - 每个达人使用独立临时 CDP 端口。默认从 `collection.cdp_port_start=9222` 开始，按配置中的达人顺序以 `collection.cdp_port_stride=10` 递增；例如前三位达人使用 `9222/9232/9242`。也可在达人配置中用 `browser_profile_key` 和 `cdp_port` 单独覆盖。
 - 浏览器和 CDP 端口只在该达人采集期间占用；采集进程退出后自动释放。串行补采复用该达人原有 profile 和端口，不创建新的登录环境。
+- 有头模式可通过 `collection.browser_window_width` / `collection.browser_window_height` 限制窗口尺寸，默认 `480x360`；无头模式不会传递该窗口尺寸参数。
 - 首轮并发采集失败的达人会在其他并发任务结束后逐个串行补采一次；成功达人不会重复采集。
 - 采集成功的达人立即进入单消费者文案队列，达人之间的文案处理仍严格串行，同一达人内部 ASR 仍按配置并发。
 - 运行摘要记录 `collection_attempts`、`fallback_to_serial`、`parallel_collection_seconds` 和可选的 `serial_retry_seconds`。
@@ -374,10 +375,11 @@ MediaCrawler 原生只支持单个 `COOKIES` 或单个持久化 `USER_DATA_DIR`�
 <MediaCrawler>/browser_data/cdp_douyin-account-2_dy_user_data_dir
 ~~~
 
-- 每个 profile 必须由不同抖音账号单独扫码登录；配置只保存 profile key，不保存或复制 Cookie。
-- 全局账号池会按达人顺序轮换起始账号，分散单账号请求量。也可在单个达人配置中用 `account_profiles` 覆盖全局顺序。
-- 只有 MediaCrawler 明确返回 `account blocked` 时才切换账号；普通网络超时或代码错误继续按原有串行补采规则处理。
-- 某个 profile 一旦在本轮返回 `account blocked`，本轮后续达人会跳过它，避免重复撞风控。
-- 账号池启用后，当前版本自动把达人采集降为串行，避免两个采集任务同时占用同一个 Chrome profile。未配置账号池时，原有达人并发采集行为不变。
+- `account_profiles` 严格按页面顺序解释：第一项是主账号，后续项目依次是备用账号；删除第一项并保存后，新的第一项自动成为主账号，不会按达人轮转顺序。
+- `collection.per_creator_profile_pool=true` 时，每位达人优先使用自己的独立 Profile（默认就是达人 key，例如 `cdp_zhiliao_dy_user_data_dir`），因此同一个主账号也能安全并发抓取多个达人。
+- 主账号扫码成功后会立即把最新登录态刷新到各达人独立 Profile；每次正式采集前还会再比较版本作为安全兜底。主账号改名或删除后，无需逐个达人重新登录。
+- 主账号明确 `account blocked` 或登录态不可用时，才会按页面顺序切换后续备用账号；共享备用 Profile 会自动排队，避免 Chrome 用户目录锁冲突。
+- 只有 MediaCrawler 明确返回 `account blocked` 时才切换账号；普通网络超时或代码错误继续按原有并发失败后串行补采规则处理。
+- 主账号 Profile 彼此独立时，采集保持 `--collect-workers` 并发；传统共享账号池仍自动降为串行，避免两个任务同时占用同一个 Chrome Profile。
 - 所有账号都不可用时，本轮报告 `partial_failure`，并保留本地与飞书已有作品；不会用空值覆盖，也不会删除历史记录。
 - `account_pool_attempts`、最终成功的 `account_profile_key` 和 `account_pool_exhausted` 会写入本轮运行摘要，便于判断哪个账号需要重新登录或冷却。

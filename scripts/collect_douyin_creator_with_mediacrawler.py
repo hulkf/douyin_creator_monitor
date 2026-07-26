@@ -847,49 +847,22 @@ def run_mediacrawler(
         "\n".join(
             [
                 "from pathlib import Path",
-                "import asyncio, ctypes, json, os, runpy, subprocess, sys, time",
+                "import asyncio, json, os, runpy, subprocess, sys",
                 f"INTERACTIVE_LOGIN_EXIT_CODE = {INTERACTIVE_LOGIN_EXIT_CODE}",
                 f"interactive_login = os.environ.get({INTERACTIVE_LOGIN_ENV!r}) == '1'",
                 f"requested_headless = {bool(getattr(args, 'headless', True))!r}",
+                f"window_width = {int(getattr(args, 'browser_window_width', 480))!r}",
+                f"window_height = {int(getattr(args, 'browser_window_height', 360))!r}",
                 f"login_only = {bool(getattr(args, 'login_only', False))!r}",
-                "def _visible_blank_chrome_windows():",
-                "    if os.name != 'nt':",
-                "        return set()",
-                "    handles = set()",
-                "    callback_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)",
-                "    user32 = ctypes.windll.user32",
-                "    def _visit(hwnd, _lparam):",
-                "        if user32.IsWindowVisible(hwnd):",
-                "            length = user32.GetWindowTextLengthW(hwnd)",
-                "            if length:",
-                "                title = ctypes.create_unicode_buffer(length + 1)",
-                "                user32.GetWindowTextW(hwnd, title, length + 1)",
-                "                if title.value == '\u65b0\u6807\u7b7e\u9875 - Google Chrome':",
-                "                    handles.add(int(hwnd))",
-                "        return True",
-                "    user32.EnumWindows(callback_type(_visit), 0)",
-                "    return handles",
-                "def _close_new_blank_chrome_windows(existing):",
-                "    if os.name != 'nt':",
-                "        return 0",
-                "    user32 = ctypes.windll.user32",
-                "    closed = set()",
-                "    for _attempt in range(20):",
-                "        for hwnd in _visible_blank_chrome_windows() - existing - closed:",
-                "            user32.ShowWindow(hwnd, 0)",
-                "            user32.PostMessageW(hwnd, 0x0010, 0, 0)",
-                "            closed.add(hwnd)",
-                "        time.sleep(0.1)",
-                "    if closed:",
-                "        print(f'[collector] closed {len(closed)} startup blank Chrome window(s)')",
-                "    return len(closed)",
+                "visible_browser = (not requested_headless) or interactive_login",
                 "_original_popen = subprocess.Popen",
                 "def _popen_without_startup_window(command, *args, **kwargs):",
                 "    if isinstance(command, (list, tuple)) and any(str(part).startswith('--remote-debugging-port=') for part in command):",
                 "        command = list(command)",
+                "        if visible_browser and not any(str(part).startswith('--window-size=') for part in command):",
+                "            command.append(f'--window-size={window_width},{window_height}')",
                 "        if requested_headless and not interactive_login and '--no-startup-window' not in command:",
                 "            command.append('--no-startup-window')",
-                "        existing_blank_windows = _visible_blank_chrome_windows() if requested_headless and not interactive_login else set()",
                 "        if os.name == 'nt' and requested_headless and not interactive_login:",
                 "            kwargs['creationflags'] = int(kwargs.get('creationflags', 0)) | subprocess.CREATE_NO_WINDOW",
                 "            startupinfo = kwargs.get('startupinfo') or subprocess.STARTUPINFO()",
@@ -898,8 +871,6 @@ def run_mediacrawler(
                 "            kwargs['startupinfo'] = startupinfo",
                 "        print('[collector] chrome launch flags headless=' + str('--headless=new' in command).lower() + ' no_startup=' + str('--no-startup-window' in command).lower())",
                 "        process = _original_popen(command, *args, **kwargs)",
-                "        if requested_headless and not interactive_login:",
-                "            _close_new_blank_chrome_windows(existing_blank_windows)",
                 "        return process",
                 "    return _original_popen(command, *args, **kwargs)",
                 "subprocess.Popen = _popen_without_startup_window",
@@ -912,6 +883,12 @@ def run_mediacrawler(
                 "config.CDP_HEADLESS = requested_headless and not interactive_login",
                 f"config.CDP_DEBUG_PORT = {cdp_port}",
                 f"config.USER_DATA_DIR = {f'{browser_profile_key}_%s_user_data_dir'!r}",
+                "# Interactive login: use Playwright's own Chromium (not system Chrome) to avoid",
+                "# Chrome 150 CDP protocol crashes. Match the cdp_ prefixed profile directory.",
+                "if interactive_login:",
+                "    config.ENABLE_CDP_MODE = False",
+                f"    config.USER_DATA_DIR = {f'cdp_{browser_profile_key}_%s_user_data_dir'!r}",
+                "    config.SAVE_LOGIN_STATE = True",
                 f"print('[collector] isolated browser profile={browser_profile_key} cdp_port_start={cdp_port} visible=' + str(not requested_headless or interactive_login).lower())",
                 "from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError",
                 "_original_page_goto = Page.goto",
@@ -936,6 +913,36 @@ def run_mediacrawler(
                 "        raise SystemExit(INTERACTIVE_LOGIN_EXIT_CODE)",
                 "    return await _original_login_begin(self)",
                 "DouYinLogin.begin = _require_visible_browser_for_login",
+                "# Robust login detection: only accept cookies that prove a FULLY",
+                "# completed login (sessionid / sid_guard / ...).  Cookies like",
+                "# odin_tt, passport_auth_status, LOGIN_STATUS, store-idc may appear",
+                "# during the login flow BEFORE the user finishes SMS verification,",
+                "# causing the window to close prematurely.",
+                "try:",
+                "    from tenacity import retry as _retry, stop_after_attempt as _stop, wait_fixed as _wait, retry_if_result as _rif",
+                "except Exception:",
+                "    from tenacity import retry as _retry, stop_after_attempt as _stop, wait_fixed as _wait, retry_if_result as _rif",
+                "async def _robust_check_login_state(self):",
+                "    try:",
+                "        _cookies = await self.browser_context.cookies()",
+                "        _names = {c.get('name') for c in (_cookies or [])}",
+                "        _login_names = {'sessionid','sessionid_ss','sid_tt','sid_guard','uid_tt','uid_tt_ss'}",
+                "        if _names & _login_names:",
+                "            return True",
+                "    except Exception:",
+                "        pass",
+                "    try:",
+                "        for _page in self.browser_context.pages:",
+                "            try:",
+                "                _ls = await _page.evaluate('() => window.localStorage')",
+                "                if _ls.get('HasUserLogin', '') == '1':",
+                "                    return True",
+                "            except Exception:",
+                "                pass",
+                "    except Exception:",
+                "        pass",
+                "    return False",
+                "DouYinLogin.check_login_state = _retry(stop=_stop(600), wait=_wait(1), retry=_rif(lambda v: v is False))(_robust_check_login_state)",
                 "_original_create_douyin_client = DouYinCrawler.create_douyin_client",
                 "async def _create_douyin_client_with_navigation_retry(self, httpx_proxy):",
                 "    for attempt in range(3):",
@@ -1054,6 +1061,13 @@ def run_mediacrawler(
     command = build_mediacrawler_command(media_dir, args.media_crawler_python, bootstrap)
     run_env = os.environ.copy()
     run_env.pop(INTERACTIVE_LOGIN_ENV, None)
+    # --login-only means the user explicitly wants to log in right now.
+    # Skip the headless probe (which wastes minutes starting Chrome, navigating
+    # to Douyin, detecting "not logged in", exiting, cleaning up, then restarting)
+    # and go straight to the visible interactive browser.
+    login_only_mode = bool(getattr(args, "login_only", False))
+    if login_only_mode:
+        run_env[INTERACTIVE_LOGIN_ENV] = "1"
     with browser_profile_lock(media_dir, browser_profile_key):
         try:
             result = subprocess.run(
@@ -1073,6 +1087,37 @@ def run_mediacrawler(
             cleanup_mediacrawler_chrome(browser_profile_key, cdp_port)
     if result.returncode != 0:
         raise SystemExit(result.returncode)
+    # Persist an explicit login-state marker so the web dashboard can show
+    # "logged in" reliably. Only write it when cookies were actually flushed
+    # to the profile dir (a freshly created Chromium cookie DB is exactly 32768
+    # bytes; a real login is ~45000+ bytes).
+    try:
+        _state_dir = Path(__file__).resolve().parents[1] / "runtime" / "account-login" / browser_profile_key
+        _cookie_file = (
+            media_dir
+            / "browser_data"
+            / f"cdp_{browser_profile_key}_dy_user_data_dir"
+            / "Default"
+            / "Network"
+            / "Cookies"
+        )
+        _cookie_size = _cookie_file.stat().st_size if _cookie_file.exists() else 0
+        if _cookie_size > 32768:
+            _state_dir.mkdir(parents=True, exist_ok=True)
+            (_state_dir / "login_state.json").write_text(
+                json.dumps(
+                    {
+                        "status": "ready",
+                        "at": datetime.now(BEIJING_TZ).isoformat(),
+                        "profile_key": browser_profile_key,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+    except Exception as _exc:
+        print(f"[collector] warning: failed to write login_state.json: {_exc}")
     report = read_existing_payload(report_file) if report_file.exists() else {
         "mode": mode,
         "probe_count": max(1, int(args.incremental_probe_count)),
@@ -1216,6 +1261,14 @@ def main() -> int:
         "--cdp-port", type=int, default=9222,
         help="Per-run CDP starting port. MediaCrawler selects the next free port when needed.",
     )
+    parser.add_argument(
+        "--browser-window-width", type=int, default=480,
+        help="Visible browser window width in pixels.",
+    )
+    parser.add_argument(
+        "--browser-window-height", type=int, default=360,
+        help="Visible browser window height in pixels.",
+    )
     parser.add_argument("--save-data-option", default="jsonl", choices=["jsonl", "json", "csv"])
     parser.add_argument("--normalize-only", action="store_true", help="Skip running MediaCrawler; only normalize existing output files.")
     parser.add_argument("--clean-media-output", action="store_true")
@@ -1233,6 +1286,10 @@ def main() -> int:
         parser.error("--incremental-probe-count must be at least 1")
     if not 1 <= args.cdp_port <= 65535:
         parser.error("--cdp-port must be between 1 and 65535")
+    if not 200 <= args.browser_window_width <= 4000:
+        parser.error("--browser-window-width must be between 200 and 4000")
+    if not 150 <= args.browser_window_height <= 3000:
+        parser.error("--browser-window-height must be between 150 and 3000")
     if args.login_only:
         run_mediacrawler(args, mode="login_only", known_ids=set())
         print(json.dumps({

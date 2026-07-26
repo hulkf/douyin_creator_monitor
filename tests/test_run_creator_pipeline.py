@@ -1033,6 +1033,416 @@ class PipelineHelpersTest(unittest.TestCase):
         self.assertIn("--headless", headless)
         self.assertNotIn("--visible-browser", headless)
 
+    def test_visible_collection_passes_small_window_dimensions(self):
+        creator = {"key": "demo", "creator_url": "creator-id"}
+        config = {
+            "python": "python",
+            "creators": [creator],
+            "collection": {
+                "headless": False,
+                "browser_window_width": 480,
+                "browser_window_height": 360,
+            },
+        }
+
+        command = PIPELINE.collect_command(
+            config,
+            creator,
+            Path("works.json"),
+            Path("media-output"),
+            Path("state.json"),
+            False,
+        )
+
+        self.assertEqual(command[command.index("--browser-window-width") + 1], "480")
+        self.assertEqual(command[command.index("--browser-window-height") + 1], "360")
+
+    def test_per_creator_profile_pool_uses_independent_primary_profiles_and_backup(self):
+        config = {
+            "collection": {
+                "account_profiles": ["account-1", "account-2"],
+                "per_creator_profile_pool": True,
+            },
+            "creators": [{"key": "zhiliao"}],
+        }
+
+        candidates = PIPELINE.account_profile_candidates(config, config["creators"][0])
+
+        self.assertEqual(
+            candidates,
+            [
+                ("zhiliao", "primary"),
+                ("account-1", "primary"),
+                ("account-2", "backup:account-2"),
+            ],
+        )
+
+    def test_page_account_order_is_preserved_for_every_creator(self):
+        creators = [
+            {"key": "first"},
+            {
+                "key": "second",
+                "account_profiles": ["account-2", "account-1"],
+            },
+        ]
+        config = {
+            "collection": {
+                "account_profiles": ["account-1", "account-2"],
+                "per_creator_profile_pool": True,
+            },
+            "creators": creators,
+        }
+
+        self.assertEqual(
+            PIPELINE.account_profile_candidates(config, creators[1]),
+            [
+                ("second", "primary"),
+                ("account-1", "primary"),
+                ("account-2", "backup:account-2"),
+            ],
+        )
+
+    def test_legacy_chromium_cookie_location_counts_as_valid_login(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = Path(directory)
+            cookie = profile / "Default" / "Cookies"
+            cookie.parent.mkdir(parents=True)
+            cookie.write_bytes(b"x" * (PIPELINE.VALID_LOGIN_MIN_BYTES + 1))
+
+            self.assertTrue(PIPELINE._has_valid_login(profile, retries=1))
+
+    def test_primary_account_change_refreshes_all_creator_profile_replicas(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_crawler_dir = root / "MediaCrawler"
+            browser_data = media_crawler_dir / "browser_data"
+
+            def write_profile(profile_key, cookie_byte):
+                profile = browser_data / f"cdp_{profile_key}_dy_user_data_dir"
+                network = profile / "Default" / "Network"
+                network.mkdir(parents=True, exist_ok=True)
+                (network / "Cookies").write_bytes(
+                    cookie_byte * (PIPELINE.VALID_LOGIN_MIN_BYTES + 1)
+                )
+                (profile / "Local State").write_text(
+                    json.dumps({"profile": profile_key}), encoding="utf-8"
+                )
+
+            write_profile("account-1", b"a")
+            write_profile("account-2", b"b")
+            write_profile("creator-a", b"x")
+            write_profile("creator-b", b"x")
+            creators = [{"key": "creator-a"}, {"key": "creator-b"}]
+            config = {
+                "collection": {
+                    "account_profiles": ["account-1", "account-2"],
+                    "per_creator_profile_pool": True,
+                    "media_crawler_dir": str(media_crawler_dir),
+                },
+                "creators": creators,
+            }
+            logger = PIPELINE.Logger(root / "sync.log", persist=False)
+
+            first = PIPELINE.refresh_primary_profile_replicas(config, creators, logger)
+
+            self.assertEqual(first["source_profiles"], ["account-1"])
+            self.assertEqual(first["refreshed"], ["creator-a", "creator-b"])
+            for key in ("creator-a", "creator-b"):
+                target = browser_data / f"cdp_{key}_dy_user_data_dir"
+                self.assertEqual(
+                    (target / "Default" / "Network" / "Cookies").read_bytes()[:1],
+                    b"a",
+                )
+                marker = json.loads(
+                    (target / ".primary-account-replica.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual(marker["source_profile"], "account-1")
+
+            creator_a_cookie = (
+                browser_data / "cdp_creator-a_dy_user_data_dir"
+                / "Default" / "Network" / "Cookies"
+            )
+            creator_a_cookie.write_bytes(
+                b"z" * (PIPELINE.VALID_LOGIN_MIN_BYTES + 1)
+            )
+            unchanged = PIPELINE.refresh_primary_profile_replicas(
+                config, creators, logger,
+            )
+            self.assertEqual(unchanged["refreshed"], [])
+            self.assertEqual(
+                unchanged["unchanged"], ["creator-a", "creator-b"],
+            )
+            self.assertEqual(creator_a_cookie.read_bytes()[:1], b"z")
+
+            config["collection"]["account_profiles"] = ["account-2"]
+            second = PIPELINE.refresh_primary_profile_replicas(config, creators, logger)
+
+            self.assertEqual(second["source_profiles"], ["account-2"])
+            self.assertEqual(second["refreshed"], ["creator-a", "creator-b"])
+            for key in ("creator-a", "creator-b"):
+                target = browser_data / f"cdp_{key}_dy_user_data_dir"
+                self.assertEqual(
+                    (target / "Default" / "Network" / "Cookies").read_bytes()[:1],
+                    b"b",
+                )
+                marker = json.loads(
+                    (target / ".primary-account-replica.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual(marker["source_profile"], "account-2")
+
+    def test_busy_primary_profile_disables_stale_replicas_without_aborting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_crawler_dir = root / "MediaCrawler"
+            browser_data = media_crawler_dir / "browser_data"
+            source_cookie = (
+                browser_data / "cdp_account-1_dy_user_data_dir"
+                / "Default" / "Network" / "Cookies"
+            )
+            source_cookie.parent.mkdir(parents=True)
+            source_cookie.write_bytes(
+                b"a" * (PIPELINE.VALID_LOGIN_MIN_BYTES + 1)
+            )
+            config = {
+                "collection": {
+                    "account_profiles": ["account-1", "account-2"],
+                    "per_creator_profile_pool": True,
+                    "media_crawler_dir": str(media_crawler_dir),
+                },
+            }
+            creators = [{"key": "creator-a"}]
+            logger = PIPELINE.Logger(root / "sync.log", persist=False)
+
+            with PIPELINE.browser_profile_file_lock(browser_data, "account-1"):
+                result = PIPELINE.refresh_primary_profile_replicas(
+                    config, creators, logger,
+                )
+
+            self.assertEqual(result["busy_profiles"], ["account-1"])
+            self.assertEqual(
+                config["_runtime_stale_primary_replicas"], {"creator-a"},
+            )
+
+    def test_profile_refresh_rolls_back_all_state_when_one_path_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            browser_data = Path(directory)
+            source = browser_data / "cdp_account-1_dy_user_data_dir"
+            target = browser_data / "cdp_creator-a_dy_user_data_dir"
+            for profile, byte, label in (
+                (source, b"a", "new"),
+                (target, b"x", "old"),
+            ):
+                network = profile / "Default" / "Network"
+                network.mkdir(parents=True)
+                (network / "Cookies").write_bytes(
+                    byte * (PIPELINE.VALID_LOGIN_MIN_BYTES + 1)
+                )
+                (profile / "Local State").write_text(label, encoding="utf-8")
+            generation = PIPELINE._primary_profile_generation(
+                "account-1", source,
+            )
+            self.assertIsNotNone(generation)
+            real_replace = PIPELINE.os.replace
+
+            def fail_while_installing_network(src, dst):
+                src_path = Path(src)
+                if (
+                    src_path.name == "Network"
+                    and ".primary-sync-" in str(src_path)
+                ):
+                    raise OSError("simulated install failure")
+                return real_replace(src, dst)
+
+            with patch.object(
+                PIPELINE.os, "replace", side_effect=fail_while_installing_network,
+            ):
+                with self.assertRaisesRegex(OSError, "simulated install failure"):
+                    PIPELINE._refresh_profile_replica(
+                        browser_data, "account-1", "creator-a", generation,
+                    )
+
+            self.assertEqual(
+                (target / "Default" / "Network" / "Cookies").read_bytes()[:1],
+                b"x",
+            )
+            self.assertEqual(
+                (target / "Local State").read_text(encoding="utf-8"),
+                "old",
+            )
+            self.assertFalse(
+                (target / PIPELINE.PRIMARY_REPLICA_MARKER).exists(),
+            )
+
+    def test_per_creator_profile_pool_keeps_requested_collection_concurrency(self):
+        creators = [{"key": "a"}, {"key": "b"}, {"key": "c"}]
+        config = {
+            "collection": {
+                "account_profiles": ["account-1", "account-2"],
+                "per_creator_profile_pool": True,
+            },
+            "creators": creators,
+        }
+
+        self.assertEqual(PIPELINE.effective_collection_workers(config, creators, 3), 3)
+
+    def test_shared_backup_profile_is_serialized_during_parallel_collection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_crawler_dir = root / "MediaCrawler"
+            for profile_key in ("a", "b", "account-a", "account-b"):
+                cookies = (
+                    media_crawler_dir / "browser_data"
+                    / f"cdp_{profile_key}_dy_user_data_dir"
+                    / "Default" / "Network" / "Cookies"
+                )
+                cookies.parent.mkdir(parents=True, exist_ok=True)
+                cookies.write_bytes(b"x" * (PIPELINE.VALID_LOGIN_MIN_BYTES + 1))
+
+            creators = []
+            for key in ("a", "b"):
+                works_file = root / f"{key}-works.json"
+                works_file.write_text(json.dumps({"works": []}), encoding="utf-8")
+                creators.append({
+                    "key": key,
+                    "creator_url": f"creator-{key}",
+                    "works_file": str(works_file),
+                    "media_output_dir": str(root / f"output-{key}"),
+                    "account_profiles": ["account-a", "account-b"],
+                })
+            config = {
+                "python": "python",
+                "state_dir": str(root / "state"),
+                "collection": {
+                    "media_crawler_dir": str(media_crawler_dir),
+                    "account_profiles": ["account-a", "account-b"],
+                    "per_creator_profile_pool": True,
+                },
+                "creators": creators,
+                "_runtime_blocked_account_profiles": set(),
+                "_runtime_blocked_account_groups": set(),
+            }
+            args = argparse.Namespace(
+                skip_collect=False,
+                normalize_only=False,
+                force_full_collect=False,
+                skip_feishu_sync=True,
+                fail_fast=False,
+                dry_run=False,
+                max_works=None,
+                aweme_id=[],
+                backfill_existing=False,
+            )
+            active = 0
+            overlap = False
+            active_guard = threading.Lock()
+
+            def run_side_effect(_label, command, _env, **_kwargs):
+                nonlocal active, overlap
+                profile = command[command.index("--browser-profile-key") + 1]
+                if profile in {"a", "b"}:
+                    raise PIPELINE.PipelineError("DataFetchError: account blocked")
+                with active_guard:
+                    if active:
+                        overlap = True
+                    active += 1
+                try:
+                    import time as _time
+                    _time.sleep(0.03)
+                finally:
+                    with active_guard:
+                        active -= 1
+
+            runner = Mock()
+            runner.run.side_effect = run_side_effect
+            with PIPELINE.ThreadPoolExecutor(max_workers=2) as executor:
+                contexts = list(executor.map(
+                    lambda creator: PIPELINE.collect_creator_phase(
+                        config, creator, runner,
+                        PIPELINE.Logger(root / "log.txt", persist=False), {}, args,
+                    ),
+                    creators,
+                ))
+
+            self.assertFalse(overlap)
+            self.assertTrue(all(context["collection_ok"] for context in contexts))
+            self.assertEqual(
+                [context["result"]["account_profile_key"] for context in contexts],
+                ["account-b", "account-b"],
+            )
+
+    def test_per_creator_primary_block_uses_backup_account_without_reusing_primary_replica(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_crawler_dir = root / "MediaCrawler"
+            for profile_key in ("demo", "account-1", "account-2"):
+                cookies = (
+                    media_crawler_dir
+                    / "browser_data"
+                    / f"cdp_{profile_key}_dy_user_data_dir"
+                    / "Default"
+                    / "Network"
+                    / "Cookies"
+                )
+                cookies.parent.mkdir(parents=True, exist_ok=True)
+                cookies.write_bytes(b"x" * (PIPELINE.VALID_LOGIN_MIN_BYTES + 1))
+            works_file = root / "works.json"
+            works_file.write_text(json.dumps({"works": []}), encoding="utf-8")
+            config = {
+                "python": "python",
+                "state_dir": str(root / "state"),
+                "collection": {
+                    "media_crawler_dir": str(media_crawler_dir),
+                    "account_profiles": ["account-1", "account-2"],
+                    "per_creator_profile_pool": True,
+                },
+                "creators": [{
+                    "key": "demo",
+                    "creator_url": "creator-id",
+                    "works_file": str(works_file),
+                    "media_output_dir": str(root / "collector-output"),
+                }],
+            }
+            args = argparse.Namespace(
+                skip_collect=False,
+                normalize_only=False,
+                force_full_collect=False,
+                skip_feishu_sync=True,
+                fail_fast=False,
+                dry_run=False,
+                max_works=None,
+                aweme_id=[],
+                backfill_existing=False,
+            )
+            attempted_profiles = []
+
+            def run_side_effect(_label, command, _env, **_kwargs):
+                profile = command[command.index("--browser-profile-key") + 1]
+                attempted_profiles.append(profile)
+                if profile == "demo":
+                    raise PIPELINE.PipelineError("DataFetchError: account blocked")
+                return ""
+
+            runner = Mock()
+            runner.run.side_effect = run_side_effect
+            context = PIPELINE.collect_creator_phase(
+                config,
+                config["creators"][0],
+                runner,
+                PIPELINE.Logger(root / "log.txt", persist=False),
+                {},
+                args,
+            )
+
+            self.assertEqual(attempted_profiles, ["demo", "account-2"])
+            self.assertTrue(context["collection_ok"])
+            self.assertEqual(config["_runtime_blocked_account_groups"], {"primary"})
+
+    def test_legacy_shared_account_pool_remains_serial(self):
+        creators = [{"key": "a"}, {"key": "b"}, {"key": "c"}]
+        config = {"collection": {"account_profiles": ["account-1"]}, "creators": creators}
+
+        self.assertEqual(PIPELINE.effective_collection_workers(config, creators, 3), 1)
+
     def test_account_pool_rotates_only_after_account_blocked(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1173,7 +1583,7 @@ class PipelineHelpersTest(unittest.TestCase):
                 [{"profile_key": "account-a", "status": "failed"}],
             )
 
-    def test_global_account_pool_round_robins_the_starting_profile(self):
+    def test_global_account_pool_preserves_page_primary_and_backup_order(self):
         creators = [{"key": "a"}, {"key": "b"}, {"key": "c"}]
         config = {
             "collection": {"account_profiles": ["account-a", "account-b"]},
@@ -1186,7 +1596,7 @@ class PipelineHelpersTest(unittest.TestCase):
         )
         self.assertEqual(
             PIPELINE.account_profile_keys(config, creators[1]),
-            ["account-b", "account-a"],
+            ["account-a", "account-b"],
         )
         self.assertEqual(
             PIPELINE.account_profile_keys(config, creators[2]),

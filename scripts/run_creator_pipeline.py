@@ -15,11 +15,14 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -43,6 +46,14 @@ STAGES = (
 
 class PipelineError(RuntimeError):
     pass
+
+
+class ProfileBlockedError(PipelineError):
+    """Raised when a profile becomes blocked while waiting for its lock."""
+
+
+class ProfileBusyError(PipelineError):
+    """Raised when login-state replication finds a browser profile in use."""
 
 
 class Logger:
@@ -163,8 +174,19 @@ def read_json(path: Path) -> dict[str, Any]:
 def write_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_suffix(path.suffix + ".tmp")
-    temp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    temp.replace(path)
+    data = json.dumps(value, ensure_ascii=False, indent=2) + "\n"
+    # 文件可能被 Obsidian / 杀软短暂锁定（Windows 上表现为 WinError 5），重试几次。
+    last_err: Exception | None = None
+    for _ in range(5):
+        try:
+            temp.write_text(data, encoding="utf-8")
+            temp.replace(path)
+            return
+        except OSError as exc:
+            last_err = exc
+            time.sleep(0.3)
+    if last_err is not None:
+        raise last_err
 
 
 def path_from(value: Any, default: Path | None = None) -> Path | None:
@@ -534,6 +556,20 @@ def collection_slot(config: dict[str, Any], creator: dict[str, Any]) -> int:
 # 有有效登录态的已有目录去采该达人的【公开】作品（只需“某个已登录账号”，
 # 不要求是本人），与 check_and_onboard_new_creators._auto_fetch_nickname 复用登录态同理。
 VALID_LOGIN_MIN_BYTES = 35000  # 真实登录 Cookies ≈45KB；空壳 SQLite 初始为 32768
+PRIMARY_REPLICA_MARKER = ".primary-account-replica.json"
+PRIMARY_REPLICA_STATE_PATHS = (
+    ("Local State",),
+    ("Default", "Network"),
+    ("Default", "Cookies"),
+    ("Default", "Cookies-journal"),
+    ("Default", "Local Storage"),
+    ("Default", "Session Storage"),
+    ("Default", "IndexedDB"),
+    ("Default", "WebStorage"),
+    ("Default", "Storage"),
+    ("Default", "Service Worker"),
+    ("Default", "Preferences"),
+)
 
 
 def _user_data_dir_for_key(browser_data: Path, profile_key: str) -> Path:
@@ -541,12 +577,303 @@ def _user_data_dir_for_key(browser_data: Path, profile_key: str) -> Path:
     return browser_data / f"cdp_{profile_key}_dy_user_data_dir"
 
 
-def _has_valid_login(udir: Path) -> bool:
-    cookies = udir / "Default" / "Network" / "Cookies"
+def _has_valid_login(udir: Path, *, retries: int = 3, delay: float = 1.0) -> bool:
+    """Check whether a Chromium profile has real Douyin login cookies.
+
+    Chrome may briefly hold an exclusive lock on the SQLite Cookies file after
+    being killed; ``stat()`` then raises ``PermissionError`` (an ``OSError``
+    subclass) which previously caused a false ``missing_login`` verdict.  Retry
+    a few times so the account-pool check is not defeated by a transient lock.
+    """
+    import time
+
+    cookies = (
+        udir / "Default" / "Network" / "Cookies",
+        udir / "Default" / "Cookies",
+    )
+    for attempt in range(retries):
+        try:
+            return any(
+                path.exists() and path.stat().st_size > VALID_LOGIN_MIN_BYTES
+                for path in cookies
+            )
+        except OSError:
+            if attempt < retries - 1:
+                time.sleep(delay)
+                continue
+            return False
+
+
+@contextmanager
+def browser_profile_file_lock(browser_data: Path, profile_key: str):
+    """Hold the same cross-process profile lock used by the collector."""
+
+    browser_data.mkdir(parents=True, exist_ok=True)
+    lock_path = browser_data / f".{safe_key(profile_key)}.profile.lock"
+    handle = lock_path.open("a+b")
+    handle.seek(0, os.SEEK_END)
+    if handle.tell() == 0:
+        handle.write(b"0")
+        handle.flush()
+    handle.seek(0)
     try:
-        return cookies.exists() and cookies.stat().st_size > VALID_LOGIN_MIN_BYTES
-    except OSError:
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        handle.close()
+        raise ProfileBusyError(
+            f"浏览器 Profile {profile_key} 正在使用，无法刷新主账号登录态。"
+        ) from exc
+    try:
+        yield
+    finally:
+        try:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
+def _primary_profile_generation(profile_key: str, profile_dir: Path) -> str | None:
+    """Return a stable generation for one logged-in canonical account profile."""
+
+    cookie_candidates = (
+        profile_dir / "Default" / "Network" / "Cookies",
+        profile_dir / "Default" / "Cookies",
+    )
+    cookie_file = next(
+        (
+            path
+            for path in cookie_candidates
+            if path.exists() and path.stat().st_size > VALID_LOGIN_MIN_BYTES
+        ),
+        None,
+    )
+    if cookie_file is None:
+        return None
+    digest = hashlib.sha256(profile_key.encode("utf-8"))
+    for relative in (
+        Path("Local State"),
+        cookie_file.relative_to(profile_dir),
+    ):
+        path = profile_dir / relative
+        digest.update(str(relative).encode("utf-8"))
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def _profile_marker(profile_dir: Path) -> dict[str, Any]:
+    marker = profile_dir / PRIMARY_REPLICA_MARKER
+    try:
+        value = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _remove_sync_path(path: Path, browser_data: Path) -> None:
+    """Remove only a validated temporary/backup path inside browser_data."""
+
+    resolved_root = browser_data.resolve()
+    resolved = path.resolve()
+    if not resolved.is_relative_to(resolved_root):
+        raise PipelineError(f"拒绝清理浏览器目录之外的同步路径：{path}")
+    if path.is_dir():
+        shutil.rmtree(path)
+    elif path.exists():
+        path.unlink()
+
+
+def _apply_replica_state(
+    stage: Path,
+    target: Path,
+    browser_data: Path,
+) -> None:
+    """Apply all staged login-state paths as one rollback-capable transaction."""
+
+    backup = Path(tempfile.mkdtemp(
+        prefix=f".{safe_key(target.name)}.primary-rollback-",
+        dir=browser_data,
+    ))
+    applied: list[tuple[Path, bool]] = []
+    try:
+        apply_paths = (
+            *PRIMARY_REPLICA_STATE_PATHS,
+            (PRIMARY_REPLICA_MARKER,),
+        )
+        for parts in apply_paths:
+            relative = Path(*parts)
+            staged_path = stage / relative
+            target_path = target / relative
+            backup_path = backup / relative
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            had_target = target_path.exists()
+            if had_target:
+                backup_path.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(target_path, backup_path)
+            applied.append((relative, had_target))
+            if staged_path.exists():
+                os.replace(staged_path, target_path)
+    except Exception:
+        for relative, had_target in reversed(applied):
+            target_path = target / relative
+            backup_path = backup / relative
+            if target_path.exists():
+                _remove_sync_path(target_path, browser_data)
+            if had_target and backup_path.exists():
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(backup_path, target_path)
+        raise
+    finally:
+        if backup.exists():
+            _remove_sync_path(backup, browser_data)
+
+
+def _refresh_profile_replica(
+    browser_data: Path,
+    source_key: str,
+    target_key: str,
+    generation: str,
+) -> bool:
+    source = _user_data_dir_for_key(browser_data, source_key)
+    target = _user_data_dir_for_key(browser_data, target_key)
+    marker = _profile_marker(target)
+    if (
+        marker.get("source_profile") == source_key
+        and marker.get("source_generation") == generation
+        and _has_valid_login(target)
+    ):
         return False
+
+    with browser_profile_file_lock(browser_data, target_key):
+        stage = Path(tempfile.mkdtemp(
+            prefix=f".{safe_key(target_key)}.primary-sync-",
+            dir=browser_data,
+        ))
+        try:
+            for parts in PRIMARY_REPLICA_STATE_PATHS:
+                relative = Path(*parts)
+                source_path = source / relative
+                staged_path = stage / relative
+                if source_path.is_dir():
+                    shutil.copytree(source_path, staged_path)
+                elif source_path.is_file():
+                    staged_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source_path, staged_path)
+            marker_stage = stage / PRIMARY_REPLICA_MARKER
+            marker_stage.write_text(
+                json.dumps({
+                    "source_profile": source_key,
+                    "source_generation": generation,
+                    "refreshed_at": datetime.now(BEIJING_TZ).isoformat(),
+                }, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            target.mkdir(parents=True, exist_ok=True)
+            _apply_replica_state(stage, target, browser_data)
+        finally:
+            if stage.exists():
+                _remove_sync_path(stage, browser_data)
+    return True
+
+
+def refresh_primary_profile_replicas(
+    config: dict[str, Any],
+    creators: list[dict[str, Any]],
+    logger: Logger,
+) -> dict[str, list[str]]:
+    """Refresh per-creator replicas from the first account shown on the page."""
+
+    groups: dict[tuple[Path, str], list[str]] = {}
+    for creator in creators:
+        if not per_creator_profile_pool_enabled(config, creator):
+            continue
+        ordered_accounts = account_profile_keys(config, creator)
+        if not ordered_accounts:
+            continue
+        defaults = section(config, "collection")
+        target_key = safe_key(str(chosen(
+            creator, defaults, "browser_profile_key", creator_key(creator),
+        )))
+        if target_key in ordered_accounts:
+            continue
+        media_crawler_dir = Path(
+            str(chosen(creator, defaults, "media_crawler_dir") or "")
+        ).expanduser()
+        browser_data = (
+            media_crawler_dir / "browser_data"
+            if str(media_crawler_dir) not in ("", ".")
+            else PROJECT_DIR / "browser_data"
+        )
+        group = (browser_data.resolve(), ordered_accounts[0])
+        groups.setdefault(group, [])
+        if target_key not in groups[group]:
+            groups[group].append(target_key)
+
+    result = {
+        "source_profiles": [],
+        "refreshed": [],
+        "unchanged": [],
+        "unavailable_sources": [],
+        "busy_profiles": [],
+    }
+    stale_replicas: set[str] = set()
+    for (browser_data, source_key), target_keys in groups.items():
+        if source_key not in result["source_profiles"]:
+            result["source_profiles"].append(source_key)
+        source = _user_data_dir_for_key(browser_data, source_key)
+        try:
+            with browser_profile_file_lock(browser_data, source_key):
+                generation = _primary_profile_generation(source_key, source)
+                if generation is None:
+                    result["unavailable_sources"].append(source_key)
+                    stale_replicas.update(target_keys)
+                    logger.write(
+                        f"主账号槽位 {source_key} 登录态不可用；本轮停用对应达人并发 Profile，"
+                        "将按页面顺序尝试备用账号。"
+                    )
+                    continue
+                for target_key in target_keys:
+                    try:
+                        refreshed = _refresh_profile_replica(
+                            browser_data, source_key, target_key, generation,
+                        )
+                    except ProfileBusyError:
+                        result["busy_profiles"].append(target_key)
+                        stale_replicas.add(target_key)
+                        logger.write(
+                            f"达人并发 Profile {target_key} 正在使用，本轮跳过刷新并改走账号池。"
+                        )
+                        continue
+                    if refreshed:
+                        result["refreshed"].append(target_key)
+                        logger.write(
+                            f"已从主账号槽位 {source_key} 刷新达人并发 Profile {target_key}"
+                        )
+                    else:
+                        result["unchanged"].append(target_key)
+        except ProfileBusyError:
+            result["busy_profiles"].append(source_key)
+            stale_replicas.update(target_keys)
+            logger.write(
+                f"主账号槽位 {source_key} 正在使用；本轮停用对应达人并发 Profile，"
+                "将按页面顺序尝试备用账号。"
+            )
+    config["_runtime_stale_primary_replicas"] = stale_replicas
+    return result
 
 
 def _find_fallback_profile_key(browser_data: Path, exclude_key: str) -> str | None:
@@ -561,13 +888,10 @@ def _find_fallback_profile_key(browser_data: Path, exclude_key: str) -> str | No
 
 
 def account_profile_keys(config: dict[str, Any], creator: dict[str, Any]) -> list[str]:
-    """Return the explicitly configured Douyin account profile pool."""
+    """Return the page-ordered global Douyin account profile pool."""
 
     defaults = section(config, "collection")
-    raw = creator.get("account_profiles")
-    creator_specific = raw not in (None, "")
-    if raw in (None, ""):
-        raw = defaults.get("account_profiles")
+    raw = defaults.get("account_profiles")
     if raw in (None, ""):
         return []
     if not isinstance(raw, list):
@@ -579,10 +903,73 @@ def account_profile_keys(config: dict[str, Any], creator: dict[str, Any]) -> lis
         key = safe_key(value)
         if key not in result:
             result.append(key)
-    if result and not creator_specific:
-        offset = collection_slot(config, creator) % len(result)
-        result = result[offset:] + result[:offset]
     return result
+
+
+def per_creator_profile_pool_enabled(config: dict[str, Any], creator: dict[str, Any]) -> bool:
+    """Whether each creator may use its own isolated primary browser profile.
+
+    The primary profile replicas are intentionally separate from the account
+    identity pool: several replicas may belong to the same daily-use account,
+    while the remaining account profiles are reserved for failover.
+    """
+
+    defaults = section(config, "collection")
+    value = creator.get("per_creator_profile_pool")
+    if value in (None, ""):
+        value = defaults.get("per_creator_profile_pool", False)
+    return bool(value)
+
+
+def account_profile_candidates(
+    config: dict[str, Any], creator: dict[str, Any],
+) -> list[tuple[str, str]]:
+    """Return ``(profile_key, account_group)`` candidates in failover order.
+
+    In per-creator mode the creator's own persistent profile is the primary
+    replica.  The first configured account profile is another primary replica
+    fallback for missing creator profiles; subsequent profiles are backup
+    account identities.  Legacy flat pools retain their previous semantics.
+    """
+
+    defaults = section(config, "collection")
+    configured = account_profile_keys(config, creator)
+    if not per_creator_profile_pool_enabled(config, creator):
+        return [(profile, f"profile:{profile}") for profile in configured]
+
+    primary = safe_key(
+        str(chosen(creator, defaults, "browser_profile_key", creator_key(creator)))
+    )
+    candidates: list[tuple[str, str]] = [(primary, "primary")]
+    for index, profile in enumerate(configured):
+        group = "primary" if index == 0 else f"backup:{profile}"
+        item = (profile, group)
+        if profile and profile not in {key for key, _ in candidates}:
+            candidates.append(item)
+    return candidates
+
+
+def effective_collection_workers(
+    config: dict[str, Any], creators: list[dict[str, Any]], requested: int,
+) -> int:
+    """Choose safe creator collection concurrency for the configured profile model."""
+
+    if requested < 1:
+        raise PipelineError("--collect-workers 必须至少为 1。")
+    pooled_creators = [
+        creator for creator in creators
+        if account_profile_keys(config, creator) or per_creator_profile_pool_enabled(config, creator)
+    ]
+    has_pool = bool(pooled_creators)
+    has_safe_replicas = bool(pooled_creators) and all(
+        per_creator_profile_pool_enabled(config, creator) for creator in pooled_creators
+    )
+    # A legacy flat pool may assign one persistent profile to multiple creators;
+    # retain its safe serial behavior. Per-creator replicas are independently
+    # locked by the collector, so they can use the requested parallelism.
+    if has_pool and not has_safe_replicas:
+        return 1
+    return requested
 
 
 def account_blocked_error(exc: BaseException | str) -> bool:
@@ -597,6 +984,53 @@ def runtime_blocked_account_profiles(config: dict[str, Any]) -> set[str]:
         blocked = set()
         config["_runtime_blocked_account_profiles"] = blocked
     return blocked
+
+
+def runtime_blocked_account_groups(config: dict[str, Any]) -> set[str]:
+    blocked = config.get("_runtime_blocked_account_groups")
+    if not isinstance(blocked, set):
+        blocked = set()
+        config["_runtime_blocked_account_groups"] = blocked
+    return blocked
+
+
+_RUNTIME_PROFILE_LOCKS_GUARD = threading.Lock()
+
+
+def runtime_profile_lock(config: dict[str, Any], profile_key: str) -> threading.Lock:
+    """Return the process-wide scheduler lock for one persistent browser profile.
+
+    The collector also has an OS-level lock, but that lock can only reject a
+    competing process.  The pipeline must wait before launching a fallback
+    collector because several creators may legitimately share one backup
+    account profile while their primary replicas remain independent.
+    """
+
+    with _RUNTIME_PROFILE_LOCKS_GUARD:
+        locks = config.get("_runtime_profile_locks")
+        if not isinstance(locks, dict):
+            locks = {}
+            config["_runtime_profile_locks"] = locks
+        lock = locks.get(profile_key)
+        if not hasattr(lock, "acquire"):
+            lock = threading.Lock()
+            locks[profile_key] = lock
+        return lock
+
+
+def run_locked_collection(
+    config: dict[str, Any], profile_key: str, group_key: str, runner: Runner,
+    label: str, command: list[str], env: dict[str, str],
+) -> str:
+    """Run one collector while holding its persistent-profile scheduler lock."""
+
+    with runtime_profile_lock(config, profile_key):
+        if (
+            profile_key in runtime_blocked_account_profiles(config)
+            or group_key in runtime_blocked_account_groups(config)
+        ):
+            raise ProfileBlockedError(f"account profile {profile_key} is blocked")
+        return runner.run(label, command, env)
 
 
 def collect_command(
@@ -658,9 +1092,24 @@ def collect_command(
     append_option(command, "--profile-output-file", profile_output_file)
     if chosen(creator, defaults, "clean_media_output", False):
         command.append("--clean-media-output")
-    command.append(
-        "--headless" if chosen(creator, defaults, "headless", True) else "--visible-browser"
-    )
+    headless = bool(chosen(creator, defaults, "headless", True))
+    command.append("--headless" if headless else "--visible-browser")
+    if not headless:
+        try:
+            window_width = int(chosen(creator, defaults, "browser_window_width", 480))
+            window_height = int(chosen(creator, defaults, "browser_window_height", 360))
+        except (TypeError, ValueError) as exc:
+            raise PipelineError(
+                "collection.browser_window_width/browser_window_height 必须是整数。"
+            ) from exc
+        if not 200 <= window_width <= 4000 or not 150 <= window_height <= 3000:
+            raise PipelineError(
+                "可见浏览器窗口尺寸超出范围：宽度 200-4000，高度 150-3000。"
+            )
+        command.extend([
+            "--browser-window-width", str(window_width),
+            "--browser-window-height", str(window_height),
+        ])
     incremental_enabled = bool(chosen(creator, defaults, "incremental_enabled", True))
     if force_full_collect or not incremental_enabled:
         command.append("--force-full-collect")
@@ -1838,8 +2287,8 @@ def collect_creator_phase(
     if args.skip_collect:
         logger.write(f"跳过采集 {name}")
     else:
-        profile_pool = [] if args.normalize_only else account_profile_keys(config, creator)
-        if profile_pool:
+        profile_candidates = [] if args.normalize_only else account_profile_candidates(config, creator)
+        if profile_candidates:
             defaults = section(config, "collection")
             media_crawler_dir = Path(
                 str(chosen(creator, defaults, "media_crawler_dir") or "")
@@ -1850,12 +2299,22 @@ def collect_creator_phase(
                 else PROJECT_DIR / "browser_data"
             )
             blocked_profiles = runtime_blocked_account_profiles(config)
+            blocked_groups = runtime_blocked_account_groups(config)
+            stale_primary_replicas = config.get("_runtime_stale_primary_replicas")
+            if not isinstance(stale_primary_replicas, set):
+                stale_primary_replicas = set()
             pool_attempts: list[dict[str, str]] = []
             last_error: Exception | None = None
             exhausted_by_block = True
             collection_ok = False
-            for profile_key in profile_pool:
-                if profile_key in blocked_profiles:
+            for profile_key, group_key in profile_candidates:
+                if profile_key in stale_primary_replicas:
+                    pool_attempts.append({
+                        "profile_key": profile_key,
+                        "status": "stale_replica",
+                    })
+                    continue
+                if profile_key in blocked_profiles or group_key in blocked_groups:
                     pool_attempts.append({
                         "profile_key": profile_key,
                         "status": "skipped_blocked",
@@ -1864,13 +2323,23 @@ def collect_creator_phase(
                 if not args.dry_run and not _has_valid_login(
                     _user_data_dir_for_key(browser_data, profile_key)
                 ):
+                    udir = _user_data_dir_for_key(browser_data, profile_key)
+                    ck = udir / "Default" / "Network" / "Cookies"
+                    logger.write(
+                        f"[诊断] 登录态检查失败 {profile_key}: "
+                        f"udir={udir}, "
+                        f"cookies_exists={ck.exists()}, "
+                        f"cookies_size={ck.stat().st_size if ck.exists() else 'N/A'}, "
+                        f"threshold={VALID_LOGIN_MIN_BYTES}"
+                    )
                     pool_attempts.append({
                         "profile_key": profile_key,
                         "status": "missing_login",
                     })
                     continue
                 try:
-                    runner.run(
+                    run_locked_collection(
+                        config, profile_key, group_key, runner,
                         f"采集 {name} [账号槽位 {profile_key}]",
                         collect_command(
                             config, creator, works_file, media_output,
@@ -1881,10 +2350,17 @@ def collect_creator_phase(
                         ),
                         env,
                     )
+                except ProfileBlockedError:
+                    pool_attempts.append({
+                        "profile_key": profile_key,
+                        "status": "skipped_blocked",
+                    })
+                    continue
                 except Exception as exc:
                     last_error = exc
                     if account_blocked_error(exc):
                         blocked_profiles.add(profile_key)
+                        blocked_groups.add(group_key)
                         pool_attempts.append({
                             "profile_key": profile_key,
                             "status": "blocked",
@@ -1907,6 +2383,7 @@ def collect_creator_phase(
                         "status": "success",
                     })
                     result["account_profile_key"] = profile_key
+                    result["account_profile_group"] = group_key
                     break
             result["account_pool_attempts"] = pool_attempts
             if not collection_ok:
@@ -2590,6 +3067,20 @@ def main(argv: list[str] | None = None) -> int:
             "dry_run": args.dry_run, "creators": [],
         }
 
+        account_pool_enabled = any(
+            account_profile_keys(config, creator)
+            or per_creator_profile_pool_enabled(config, creator)
+            for creator in creators
+        )
+        if account_pool_enabled:
+            config["_runtime_blocked_account_profiles"] = set()
+            config["_runtime_blocked_account_groups"] = set()
+            config["_runtime_stale_primary_replicas"] = set()
+            if not args.skip_collect and not args.normalize_only and not args.dry_run:
+                summary["primary_profile_refresh"] = refresh_primary_profile_replicas(
+                    config, creators, logger,
+                )
+
         if args.fail_fast:
             # Preserve immediate-stop semantics when explicitly requested.
             for creator in creators:
@@ -2606,19 +3097,15 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     summary["creators"].append(creator_result)
         else:
-            collect_workers = int(args.collect_workers)
-            if collect_workers < 1:
-                raise PipelineError("--collect-workers 必须至少为 1。")
-            account_pool_enabled = any(
-                account_profile_keys(config, creator) for creator in creators
+            requested_collect_workers = int(args.collect_workers)
+            collect_workers = effective_collection_workers(
+                config, creators, requested_collect_workers,
             )
-            if account_pool_enabled:
-                config["_runtime_blocked_account_profiles"] = set()
-                if collect_workers != 1:
+            if collect_workers != requested_collect_workers:
+                if account_pool_enabled:
                     logger.write(
-                        "账号池已启用：首版使用串行达人采集，避免多个任务同时占用同一登录 profile。"
+                        "共享账号池已启用：采集降为串行，避免多个任务同时占用同一登录 profile。"
                     )
-                collect_workers = 1
 
             # Creator collection is a bounded parallel producer. Successful creators
             # enter the single-consumer transcript queue immediately. Only creators
