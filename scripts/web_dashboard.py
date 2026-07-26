@@ -27,6 +27,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import gui_dashboard as GUI  # noqa: E402
+import run_creator_pipeline as PIPELINE  # noqa: E402
 
 
 CONFIG_RELATIVE_PATH = Path("local") / "pipeline.json"
@@ -175,6 +176,8 @@ def validate_pipeline_config(config: Any) -> list[str]:
         ("max_count", 1),
         ("expect_min_count", 0),
         ("profile_max_workers", 1),
+        ("browser_window_width", 200),
+        ("browser_window_height", 150),
     ):
         _check_integer(collection, key, f"collection.{key}", errors, minimum=minimum)
     _check_integer(
@@ -192,7 +195,7 @@ def validate_pipeline_config(config: Any) -> list[str]:
         errors,
         minimum=0,
     )
-    for key in ("incremental_enabled", "clean_media_output", "headless"):
+    for key in ("incremental_enabled", "clean_media_output", "headless", "per_creator_profile_pool"):
         _check_boolean(collection, key, f"collection.{key}", errors)
     profiles = collection.get("account_profiles", [])
     if not isinstance(profiles, list) or any(not isinstance(item, str) for item in profiles):
@@ -288,11 +291,15 @@ def save_pipeline_config(config: Any, project_dir: Path = PROJECT_DIR) -> SavedC
     serialized = json.dumps(config, ensure_ascii=False, indent=2) + "\n"
 
     with _CONFIG_LOCK:
+        actual_backup: Path | None = None
         if path.exists():
-            shutil.copyfile(path, backup_path)
-            actual_backup: Path | None = backup_path
-        else:
-            actual_backup = None
+            # 备份只是保险，失败（如被其他进程/编辑器占用）不应阻止主配置保存，
+            # 否则账号池扫码登录前的 PUT /api/config 会卡在备份步骤。
+            try:
+                shutil.copyfile(path, backup_path)
+                actual_backup = backup_path
+            except OSError:
+                actual_backup = None
         temp_handle = tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
@@ -353,9 +360,9 @@ def snapshot_payload(snapshot: GUI.DashboardSnapshot) -> dict[str, Any]:
         "pending_works": snapshot.pending_works,
         "account_profiles_total": snapshot.account_profiles_total,
         "account_profiles_detected": snapshot.account_profiles_detected,
-        "latest_log": str(snapshot.latest_log) if running and snapshot.latest_log else None,
-        "log_tail": snapshot.log_tail if running else "当前没有正在执行的任务。",
-        "activity_events": activity_events(snapshot.log_tail) if running else [],
+        "latest_log": str(snapshot.latest_log) if snapshot.latest_log else None,
+        "log_tail": snapshot.log_tail if snapshot.latest_log else "当前没有正在执行的任务。",
+        "activity_events": activity_events(snapshot.log_tail) if snapshot.latest_log else [],
         "refreshed_at": _iso(snapshot.refreshed_at),
     }
 
@@ -516,6 +523,80 @@ def run_history_payload(
     }
 
 
+# 作品处理阶段顺序与中文标签，对应流水线 STAGES。
+# 各阶段状态持久化在 runtime/pipeline/<达人key>/<作品id>.json 的 stages 字典中。
+WORK_STAGE_ORDER = [
+    ("collected", "采集"),
+    ("feishu_synced", "飞书同步"),
+    ("transcribed", "转写"),
+    ("corrected", "校正"),
+    ("summarized", "总结"),
+    ("feishu_written_back", "飞书回写"),
+    ("ima_backed_up", "IMA 备份"),
+    ("kuake_backed_up", "夸克备份"),
+    ("obsidian_exported", "Obsidian 导出"),
+    ("backup_statuses_written_back", "状态回写"),
+]
+
+
+def work_funnel_payload(project_dir: Path = PROJECT_DIR) -> dict[str, Any]:
+    """聚合每位达人状态目录下的作品阶段状态，产出处理漏斗统计。
+
+    只读 runtime/pipeline/<达人key>/*.json，不修改任何流水线产物。
+    """
+    project_dir = project_dir.resolve()
+    config = load_pipeline_config(project_dir).config
+    state_dir = GUI.project_path(
+        project_dir,
+        config.get("state_dir"),
+        project_dir / "runtime" / "pipeline",
+    )
+    stage_keys = [key for key, _ in WORK_STAGE_ORDER]
+    creators_out: list[dict[str, Any]] = []
+    global_counts = {key: 0 for key in stage_keys}
+    global_total = 0
+    for creator in config.get("creators", []):
+        if not isinstance(creator, dict) or not creator.get("enabled", True):
+            continue
+        key = str(
+            creator.get("key")
+            or creator.get("creator_dir_name")
+            or creator.get("creator_name")
+            or "?"
+        )
+        name = str(creator.get("creator_name") or creator.get("creator_dir_name") or key)
+        dir_path = state_dir / key
+        files = sorted(dir_path.glob("*.json")) if dir_path.is_dir() else []
+        per_counts = {k: 0 for k in stage_keys}
+        n = 0
+        for fp in files:
+            data = GUI.read_json(fp)
+            if not isinstance(data, dict):
+                continue
+            stages = data.get("stages")
+            n += 1
+            if not isinstance(stages, dict):
+                continue
+            for sk in stage_keys:
+                stage = stages.get(sk)
+                if isinstance(stage, dict) and stage.get("status") == "success":
+                    per_counts[sk] += 1
+        for sk in stage_keys:
+            global_counts[sk] += per_counts[sk]
+        global_total += n
+        if n:
+            creators_out.append({"key": key, "name": name, "total": n, "stages": per_counts})
+    stages_out = [
+        {"key": k, "label": lbl, "success": global_counts[k]}
+        for k, lbl in WORK_STAGE_ORDER
+    ]
+    return {
+        "total_works_with_state": global_total,
+        "stages": stages_out,
+        "creators": creators_out,
+    }
+
+
 def _account_profile_keys(config: dict[str, Any]) -> list[str]:
     collection = config.get("collection")
     collection = collection if isinstance(collection, dict) else {}
@@ -545,6 +626,14 @@ def _account_cookie_file(project_dir: Path, config: dict[str, Any], profile_key:
     )
 
 
+# Keep the dashboard and runtime collector on one login-validity threshold.
+VALID_LOGIN_MIN_BYTES = PIPELINE.VALID_LOGIN_MIN_BYTES
+
+
+def _account_login_state_file(project_dir: Path, profile_key: str) -> Path:
+    return project_dir / "runtime" / "account-login" / profile_key / "login_state.json"
+
+
 def account_pool_payload(project_dir: Path = PROJECT_DIR) -> dict[str, Any]:
     project_dir = project_dir.resolve()
     loaded = load_pipeline_config(project_dir)
@@ -555,16 +644,35 @@ def account_pool_payload(project_dir: Path = PROJECT_DIR) -> dict[str, Any]:
             return_code = process.poll() if process is not None else None
             running = process is not None and return_code is None
             cookie_file = _account_cookie_file(project_dir, loaded.config, key)
-            try:
-                stat = cookie_file.stat()
-                ready = stat.st_size >= GUI.VALID_LOGIN_MIN_BYTES
-                updated_at = datetime.fromtimestamp(stat.st_mtime).astimezone().isoformat()
-            except OSError:
-                ready = False
-                updated_at = None
+            # Older Chromium/Playwright writes cookies to Default/Cookies instead of Default/Network/Cookies.
+            legacy_cookie_file = cookie_file.parent.parent / "Cookies"
+            ready = False
+            updated_at = None
+            for candidate in (cookie_file, legacy_cookie_file):
+                try:
+                    stat = candidate.stat()
+                except OSError:
+                    continue
+                if stat.st_size > VALID_LOGIN_MIN_BYTES:
+                    ready = True
+                    updated_at = datetime.fromtimestamp(stat.st_mtime).astimezone().isoformat()
+                    break
+            # Explicit login-state marker written by the login script on success.
+            marker_ready = False
+            if not running:
+                state_file = _account_login_state_file(project_dir, key)
+                try:
+                    marker = json.loads(state_file.read_text(encoding="utf-8"))
+                    if marker.get("status") == "ready":
+                        marker_ready = True
+                except (OSError, ValueError):
+                    marker_ready = False
+            # The cookie file on disk is authoritative: a present-but-empty shell
+            # (32768 bytes) means NOT logged in even if a stale marker exists.
+            effective_ready = ready or (marker_ready and not cookie_file.exists())
             if running:
                 status = "running"
-            elif ready:
+            elif effective_ready:
                 status = "ready"
             elif process is not None and return_code not in (None, 0):
                 status = "failed"
@@ -635,6 +743,70 @@ def build_account_login_command(
     return command
 
 
+def _record_replica_refresh(
+    project_dir: Path,
+    profile_key: str,
+    status: str,
+    detail: dict[str, Any] | str,
+) -> None:
+    state_file = _account_login_state_file(project_dir, profile_key)
+    try:
+        current = json.loads(state_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        current = {"status": "ready", "profile_key": profile_key}
+    current["replica_refresh"] = {
+        "status": status,
+        "at": datetime.now().astimezone().isoformat(),
+        "detail": detail,
+    }
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    temporary = state_file.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps(current, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    os.replace(temporary, state_file)
+
+
+def refresh_replicas_after_account_login(
+    profile_key: str,
+    process: subprocess.Popen[Any],
+    project_dir: Path = PROJECT_DIR,
+) -> None:
+    """Refresh creator replicas immediately after the current main login exits."""
+
+    return_code = process.wait()
+    if return_code:
+        return
+    try:
+        config = load_pipeline_config(project_dir).config
+        ordered_profiles = _account_profile_keys(config)
+        if not ordered_profiles or ordered_profiles[0] != profile_key:
+            return
+        creators = [
+            creator
+            for creator in config.get("creators", [])
+            if isinstance(creator, dict) and creator.get("enabled", True)
+        ]
+        log_path = (
+            project_dir / "runtime" / "account-login"
+            / profile_key / "replica-refresh.log"
+        )
+        result = PIPELINE.refresh_primary_profile_replicas(
+            config, creators, PIPELINE.Logger(log_path),
+        )
+        _record_replica_refresh(
+            project_dir, profile_key, "success", result,
+        )
+    except Exception as exc:  # noqa: BLE001 - watcher must not kill the web server
+        try:
+            _record_replica_refresh(
+                project_dir, profile_key, "failed", str(exc),
+            )
+        except OSError:
+            pass
+
+
 def start_account_login(profile_key: str, project_dir: Path = PROJECT_DIR) -> dict[str, Any]:
     project_dir = project_dir.resolve()
     try:
@@ -662,6 +834,12 @@ def start_account_login(profile_key: str, project_dir: Path = PROJECT_DIR) -> di
         except OSError as exc:
             raise WebDashboardError(f"无法启动账号槽位 {profile_key} 的扫码登录：{exc}") from exc
         _ACCOUNT_LOGIN_PROCESSES[profile_key] = process
+        threading.Thread(
+            target=refresh_replicas_after_account_login,
+            args=(profile_key, process, project_dir),
+            name=f"account-profile-refresh-{profile_key}",
+            daemon=True,
+        ).start()
     return {
         "message": f"已打开账号槽位 {profile_key} 的抖音扫码窗口",
         "profile_key": profile_key,
@@ -685,6 +863,7 @@ def make_handler(
     account_status_provider: Callable[[Path], dict[str, Any]] = account_pool_payload,
     account_login_starter: Callable[[str, Path], dict[str, Any]] = start_account_login,
     history_provider: Callable[[Path], dict[str, Any]] = run_history_payload,
+    funnel_provider: Callable[[Path], dict[str, Any]] = work_funnel_payload,
 ) -> type[BaseHTTPRequestHandler]:
     project_dir = project_dir.resolve()
     web_dir = project_dir / WEB_DIR_RELATIVE_PATH
@@ -772,6 +951,8 @@ def make_handler(
                     self._json(HTTPStatus.OK, account_status_provider(project_dir))
                 elif path == "/api/history":
                     self._json(HTTPStatus.OK, history_provider(project_dir))
+                elif path == "/api/funnel":
+                    self._json(HTTPStatus.OK, funnel_provider(project_dir))
                 elif path.startswith("/api/"):
                     self._error(HTTPStatus.NOT_FOUND, "接口不存在")
                 else:

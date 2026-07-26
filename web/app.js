@@ -8,6 +8,8 @@ const state = {
   activeCreatorIndex: 0,
   accountPool: { profiles: [] },
   history: { stats: {}, runs: [] },
+  funnel: null,
+  lastStatus: null,
 };
 
 const sectionDefinitions = [
@@ -41,6 +43,9 @@ const sectionDefinitions = [
       ["collection.min_publish_date", "最早发布日期", "text", "格式 YYYY-MM-DD；留空表示不限制。"],
       ["collection.login_type", "登录方式", "select", "MediaCrawler 登录方式。", false, ["qrcode", "cookie"]],
       ["collection.headless", "使用无头浏览器", "boolean", "关闭后采集时打开可见 Chrome；可见模式更便于观察，也可能降低账号被限制的概率。", true],
+      ["collection.browser_window_width", "可见窗口宽度", "number", "有头模式下 Chrome 窗口宽度（像素），默认 480。"],
+      ["collection.browser_window_height", "可见窗口高度", "number", "有头模式下 Chrome 窗口高度（像素），默认 360。"],
+      ["collection.per_creator_profile_pool", "按达人隔离主 Profile", "boolean", "主账号可为每位达人复用独立 Profile 并发采集；账号池中的后续槽位仅作故障切换。"],
       ["collection.save_data_option", "原始数据格式", "select", "推荐使用 jsonl。", false, ["jsonl", "json", "csv"]],
       ["collection.profile_max_workers", "主页采集并发", "number", "达人资料采集的最大并发数。"],
       ["collection.profile_ttl_hours", "主页缓存时长（小时）", "number", "缓存未过期时复用本地资料。"],
@@ -254,12 +259,15 @@ function statusText(status) {
 }
 
 function renderStatus(data) {
+  state.lastStatus = data;
   const running = String(data.task.state).toLowerCase() === "running";
   el("task-pill").className = `task-pill ${running ? "running" : "ready"}`;
   el("task-pill-text").textContent = running ? "任务正在运行" : `任务${statusText(data.task.state)}`;
   el("run-button").disabled = running;
-  el("metric-creators").textContent = `${data.total_creators} 位 / ${data.total_works} 条`;
+  el("metric-creators").textContent = `${data.total_creators} 位`;
   el("metric-creators-note").textContent = `已启用 ${data.total_creators} 位达人`;
+  el("metric-works").textContent = `${data.total_works} 条`;
+  el("metric-works-note").textContent = `跨 ${data.total_creators} 位达人`;
   el("metric-pending").textContent = `${data.pending_works} 条`;
   el("metric-accounts").textContent = data.account_profiles_total ? `${data.account_profiles_detected} / ${data.account_profiles_total}` : "未启用";
   el("current-task-state").textContent = statusText(data.task.state);
@@ -308,7 +316,8 @@ function renderStatus(data) {
   const events = Array.isArray(data.activity_events) ? data.activity_events : [];
   const currentBody = el("current-creator-table-body");
   currentBody.replaceChildren();
-  const currentCreators = running ? data.creators : [];
+  const hasEvents = events.length > 0;
+  const currentCreators = (running || hasEvents) ? data.creators : [];
   let currentSuccess = 0;
   let currentFailed = 0;
   let currentActive = 0;
@@ -345,10 +354,12 @@ function renderStatus(data) {
     row.append(cell); currentBody.append(row);
   }
   const finishedCreators = currentSuccess + currentFailed;
-  el("current-creator-result").textContent = running ? `${finishedCreators} / ${data.total_creators}` : "—";
-  el("current-creator-result-note").textContent = running ? "已结束 / 全部达人" : "等待任务开始";
+  el("current-creator-result").textContent = (running || hasEvents) ? `${finishedCreators} / ${data.total_creators}` : "—";
+  el("current-creator-result-note").textContent = running ? "已结束 / 全部达人" : hasEvents ? "最近一次运行已结束" : "等待任务开始";
   el("current-creator-summary").textContent = running
     ? `${currentSuccess} 正常 · ${currentFailed} 异常 · ${currentActive} 等待或进行中`
+    : hasEvents
+    ? `${currentSuccess} 正常 · ${currentFailed} 异常`
     : "当前任务待命";
 
   const timeline = el("activity-timeline"); timeline.replaceChildren();
@@ -365,7 +376,33 @@ function renderStatus(data) {
     timeline.append(empty);
   }
   el("activity-count").textContent = `${events.length} 条事件`;
+  renderOverviewExtras();
   el("status-error").classList.add("hidden");
+  syncHeadlessToggle();
+}
+
+function syncHeadlessToggle() {
+  const toggle = el("headless-toggle");
+  if (!toggle) return;
+  const value = Boolean(state.config && state.config.collection && state.config.collection.headless);
+  toggle.checked = value;
+}
+
+async function onHeadlessToggle() {
+  const toggle = el("headless-toggle");
+  if (!toggle || !state.config) return;
+  if (!state.config.collection || typeof state.config.collection !== "object") state.config.collection = {};
+  const next = toggle.checked;
+  state.config.collection.headless = next;
+  try {
+    const payload = await api("/api/config", { method: "PUT", body: JSON.stringify(state.config) });
+    state.config = payload.config;
+    syncHeadlessToggle();
+    toast(next ? "已切换为无头模式（后台运行，不弹窗口）" : "已切换为有头模式（采集时打开可见 Chrome）");
+  } catch (error) {
+    syncHeadlessToggle();
+    toast(error.message, "error");
+  }
 }
 
 function renderHistory(data) {
@@ -382,6 +419,8 @@ function renderHistory(data) {
   el("history-issues").textContent = stats.issue_runs || 0;
   el("history-rate").textContent = `${stats.success_rate || 0}%`;
   el("history-latest-success").textContent = `最近成功：${formatFullTime(stats.latest_success_at)}`;
+  if (el("metric-last-success")) el("metric-last-success").textContent = formatTime(stats.latest_success_at);
+  if (el("overview-health-headline")) updateHealthHeadline();
 
   const list = el("history-list"); list.replaceChildren();
   (data.runs || []).forEach((run, index) => {
@@ -416,6 +455,182 @@ function renderHistory(data) {
   if (!(data.runs || []).length) {
     const empty = document.createElement("div"); empty.className = "empty-cell"; empty.textContent = "还没有历史运行记录";
     list.append(empty);
+  }
+}
+
+function updateHealthHeadline() {
+  const host = el("overview-health-headline");
+  if (!host) return;
+  const runs = (state.history && state.history.runs) || [];
+  host.textContent = runs.length ? runs[0].headline : "还没有历史运行记录";
+}
+
+function renderAccountDetail() {
+  const host = el("overview-account-list");
+  if (!host) return;
+  const profiles = (state.accountPool && state.accountPool.profiles) || [];
+  host.replaceChildren();
+  if (!profiles.length) {
+    const empty = document.createElement("div"); empty.className = "empty-cell"; empty.textContent = "账号池未配置";
+    host.append(empty); return;
+  }
+  profiles.forEach((profile) => {
+    const row = document.createElement("div"); row.className = "account-detail-row";
+    const left = document.createElement("div"); left.className = "account-detail-id";
+    const dot = document.createElement("span"); dot.className = `account-state-dot ${profile.status}`;
+    const key = document.createElement("strong"); key.textContent = profile.key;
+    left.append(dot, key);
+    const right = document.createElement("div"); right.className = "account-detail-meta";
+    const badge = document.createElement("span"); badge.className = `account-state-badge ${profile.status}`; badge.textContent = accountStatusText(profile.status);
+    const updated = document.createElement("small"); updated.textContent = profile.updated_at ? `更新于 ${formatTime(profile.updated_at)}` : "未检测到登录文件";
+    right.append(badge, updated);
+    if (profile.status !== "ready" && profile.status !== "running") {
+      const btn = document.createElement("button"); btn.type = "button"; btn.className = "button secondary small"; btn.textContent = "去扫码";
+      btn.addEventListener("click", () => startAccountLoginByKey(profile.key));
+      right.append(btn);
+    }
+    row.append(left, right);
+    host.append(row);
+  });
+}
+
+function renderChannels() {
+  const host = el("overview-channels");
+  if (!host) return;
+  const config = state.config || {};
+  const items = [
+    ["飞书", Boolean(getPath(config, "feishu.creator_table_id"))],
+    ["转写", Boolean(getPath(config, "asr.provider"))],
+    ["总结", Boolean(getPath(config, "summary.enabled"))],
+    ["IMA", Boolean(getPath(config, "ima.enabled"))],
+    ["夸克", Boolean(getPath(config, "kuake.enabled"))],
+    ["Obsidian", Boolean(getPath(config, "obsidian.enabled"))],
+  ];
+  host.replaceChildren();
+  items.forEach(([label, on]) => {
+    const chip = document.createElement("span"); chip.className = `channel-chip ${on ? "on" : "off"}`;
+    chip.textContent = `${label} ${on ? "开" : "关"}`;
+    host.append(chip);
+  });
+}
+
+function renderFunnel() {
+  const host = el("funnel-bars");
+  if (!host || !state.funnel) return;
+  const funnel = state.funnel;
+  const total = funnel.total_works_with_state || 0;
+  const totalEl = el("funnel-total");
+  if (totalEl) totalEl.textContent = total ? `${total} 部作品已处理` : "—";
+  host.replaceChildren();
+  if (!total) {
+    const empty = document.createElement("div"); empty.className = "empty-cell"; empty.textContent = "还没有作品处理记录";
+    host.append(empty); return;
+  }
+  funnel.stages.forEach((stage) => {
+    const success = stage.success || 0;
+    const ratio = total ? success / total : 0;
+    const cls = success === total ? "full" : success === 0 ? "empty" : "partial";
+    const row = document.createElement("div"); row.className = "funnel-row";
+    const label = document.createElement("div"); label.className = "funnel-label"; label.textContent = stage.label;
+    const bar = document.createElement("div"); bar.className = "funnel-track";
+    const fill = document.createElement("div"); fill.className = `funnel-fill ${cls}`; fill.style.width = `${Math.round(ratio * 100)}%`;
+    bar.append(fill);
+    const count = document.createElement("div"); count.className = "funnel-count"; count.textContent = `${success}/${total}`;
+    row.append(label, bar, count);
+    host.append(row);
+  });
+  const fc = el("funnel-creators");
+  if (fc) {
+    fc.replaceChildren();
+    if (!funnel.creators.length) {
+      const empty = document.createElement("div"); empty.className = "empty-cell"; empty.textContent = "暂无达人";
+      fc.append(empty);
+    } else {
+      funnel.creators.forEach((creator) => {
+        const done = (creator.stages && creator.stages.summarized) || 0;
+        const row = document.createElement("div"); row.className = "funnel-creator-row";
+        const name = document.createElement("span"); name.className = "funnel-creator-name"; name.textContent = creator.name;
+        const track = document.createElement("div"); track.className = "funnel-track small";
+        const fill = document.createElement("div"); fill.className = `funnel-fill ${done === creator.total ? "full" : done === 0 ? "empty" : "partial"}`;
+        fill.style.width = creator.total ? `${Math.round(done / creator.total * 100)}%` : "0%";
+        track.append(fill);
+        const count = document.createElement("span"); count.className = "funnel-creator-count"; count.textContent = `总结 ${done}/${creator.total}`;
+        row.append(name, track, count);
+        fc.append(row);
+      });
+    }
+  }
+}
+
+function deriveAlerts() {
+  const host = el("overview-alerts");
+  if (!host) return;
+  const alerts = [];
+  const status = state.lastStatus || {};
+  const profiles = (state.accountPool && state.accountPool.profiles) || [];
+  profiles.forEach((profile) => {
+    if (profile.status === "missing") alerts.push({ level: "error", text: `账号槽位 ${profile.key} 登录态缺失，最近运行可能因此失败`, key: profile.key });
+    else if (profile.status === "failed") alerts.push({ level: "error", text: `账号槽位 ${profile.key} 登录未完成`, key: profile.key });
+  });
+  (status.creators || []).forEach((creator) => {
+    if (["failed", "partial_failure", "not_run"].includes(creator.status)) {
+      const detail = creator.detail ? `：${creator.detail}` : "";
+      alerts.push({ level: creator.status === "not_run" ? "warn" : "error", text: `达人 ${creator.name} 最近运行异常${detail}` });
+    }
+  });
+  if (status.pending_works > 0) {
+    alerts.push({ level: "warn", text: `${status.pending_works} 条作品待处理（等待转写 / 总结 / 回写 / 备份）` });
+  }
+  const runs = (state.history && state.history.runs) || [];
+  if (runs.length && ["failed", "partial_failure"].includes(runs[0].status)) {
+    (runs[0].issues || []).slice(0, 3).forEach((issue) => alerts.push({ level: "error", text: `${issue.creator}：${issue.message}` }));
+  }
+  if (state.funnel && state.funnel.total_works_with_state) {
+    const summarized = state.funnel.stages.find((stage) => stage.key === "summarized");
+    const total = state.funnel.total_works_with_state;
+    if (summarized && summarized.success < total * 0.8) {
+      alerts.push({ level: "warn", text: `内容总结仅完成 ${summarized.success}/${total} 部，其余未生成归档卡片` });
+    }
+  }
+  host.replaceChildren();
+  if (!alerts.length) { host.classList.add("hidden"); return; }
+  host.classList.remove("hidden");
+  alerts.slice(0, 6).forEach((alert) => {
+    const row = document.createElement("div"); row.className = `alert-item ${alert.level}`;
+    const dot = document.createElement("span"); dot.className = "alert-dot";
+    const text = document.createElement("span"); text.className = "alert-text"; text.textContent = alert.text;
+    row.append(dot, text);
+    if (alert.key) {
+      const btn = document.createElement("button"); btn.type = "button"; btn.className = "alert-action"; btn.textContent = "去扫码";
+      btn.addEventListener("click", () => startAccountLoginByKey(alert.key));
+      row.append(btn);
+    }
+    host.append(row);
+  });
+}
+
+function renderOverviewExtras() {
+  renderAccountDetail();
+  renderChannels();
+  renderFunnel();
+  updateHealthHeadline();
+  deriveAlerts();
+}
+
+function startAccountLoginByKey(key) {
+  const profiles = getPath(state.config, "collection.account_profiles") || [];
+  const index = profiles.indexOf(key);
+  if (index < 0) { toast(`账号槽位 ${key} 不在配置中`, "error"); return; }
+  startAccountLogin(index);
+}
+
+async function loadFunnel(showFeedback = false) {
+  try {
+    state.funnel = await api("/api/funnel");
+    renderOverviewExtras();
+    if (showFeedback) toast("处理漏斗已刷新");
+  } catch (error) {
+    if (showFeedback) toast(error.message, "error");
   }
 }
 
@@ -565,9 +780,9 @@ function renderAccountPoolManager() {
   const body = document.createElement("div"); body.className = "account-pool-body";
   const intro = document.createElement("div"); intro.className = "account-pool-intro";
   const introText = document.createElement("div");
-  const introTitle = document.createElement("strong"); introTitle.textContent = "一个槽位对应一个独立浏览器 Profile";
+  const introTitle = document.createElement("strong"); introTitle.textContent = "账号槽位与达人 Profile 相互隔离";
   const introDescription = document.createElement("p");
-  introDescription.textContent = "扫码完成后 Cookie 由 Chromium 保存在 MediaCrawler/browser_data，不进入项目配置和日志。状态仅表示检测到本地登录文件，不代表账号当前未被风控。";
+  introDescription.textContent = "列表第一项永远是主账号，后续项目依次是备用账号；删除第一项并保存后，新的第一项自动成为主账号。主账号扫码成功后会立即刷新达人并发 Profile，Cookie 只保存在本机 MediaCrawler/browser_data。";
   introText.append(introTitle, introDescription);
   const refresh = document.createElement("button"); refresh.type = "button"; refresh.className = "button secondary"; refresh.textContent = "刷新登录状态";
   refresh.addEventListener("click", () => loadAccountPoolStatus(true));
@@ -582,7 +797,8 @@ function renderAccountPoolManager() {
     const identity = document.createElement("div"); identity.className = "account-pool-identity";
     const number = document.createElement("span"); number.textContent = String(index + 1).padStart(2, "0");
     const field = document.createElement("div"); field.className = "field";
-    const label = document.createElement("label"); label.textContent = "账号槽位名称";
+    const label = document.createElement("label");
+    label.textContent = index === 0 ? "账号槽位名称 · 主账号" : `账号槽位名称 · 备用账号 ${index}`;
     const input = document.createElement("input"); input.type = "text"; input.value = profileKey; input.dataset.accountProfileIndex = String(index);
     const help = document.createElement("small"); help.textContent = "稳定标识，例如 account-a；修改名称会创建新的 Profile。";
     field.append(label, input, help); identity.append(number, field);
@@ -891,6 +1107,8 @@ function switchTab(tab) {
     history: "历史运行",
     config: "项目配置",
   })[tab] || "项目总览";
+  // “立即运行”只在“当前任务”页出现：总览与历史是只读页面，没有可执行的东西。
+  el("run-button").style.display = tab === "current" ? "" : "none";
   if (tab === "current") loadStatus(false);
   if (tab === "history") loadHistory(false);
 }
@@ -898,7 +1116,7 @@ function switchTab(tab) {
 async function refreshActivePage() {
   if (state.activeTab === "history") return loadHistory(true);
   if (state.activeTab === "overview") {
-    await Promise.all([loadStatus(false), loadHistory(false)]);
+    await Promise.all([loadStatus(false), loadHistory(false), loadFunnel(false)]);
     toast("项目总览已刷新");
     return;
   }
@@ -909,6 +1127,7 @@ async function refreshActivePage() {
 document.querySelectorAll("[data-tab-target]").forEach((button) => button.addEventListener("click", () => switchTab(button.dataset.tabTarget)));
 el("refresh-button").addEventListener("click", refreshActivePage);
 el("run-button").addEventListener("click", runNow);
+el("headless-toggle").addEventListener("change", onHeadlessToggle);
 el("save-config-button").addEventListener("click", saveConfig);
 el("config-form").addEventListener("input", markDirty);
 el("config-form").addEventListener("change", markDirty);
@@ -921,9 +1140,12 @@ window.addEventListener("beforeunload", (event) => {
   event.preventDefault(); event.returnValue = "";
 });
 
+// 初始页为“项目总览”，默认隐藏“立即运行”按钮（仅“当前任务”页显示）。
+el("run-button").style.display = "none";
 loadStatus(false);
 loadHistory(false);
 loadConfig(false);
+loadFunnel(false);
 setInterval(() => { if (["overview", "current"].includes(state.activeTab)) loadStatus(false); }, 12_000);
 setInterval(() => { if (["overview", "history"].includes(state.activeTab)) loadHistory(false); }, 30_000);
 setInterval(() => {

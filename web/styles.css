@@ -68,7 +68,7 @@ h1 { margin: 0; font-family: Georgia, "Songti SC", serif; font-size: 27px; font-
 
 .tab-page { display: none; padding-top: 27px; }
 .tab-page.active { display: block; }
-.metric-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
+.metric-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(178px, 1fr)); gap: 14px; }
 .metric-card { position: relative; min-height: 148px; padding: 21px 22px; border: 1px solid var(--line); border-radius: 13px; background: var(--panel); box-shadow: 0 4px 16px rgba(44,38,30,.035); overflow: hidden; }
 .metric-card::after { content: ""; position: absolute; right: -25px; bottom: -34px; width: 100px; height: 100px; border-radius: 50%; background: currentColor; opacity: .055; }
 .metric-icon { position: absolute; right: 18px; top: 18px; width: 29px; height: 29px; display: grid; place-items: center; border-radius: 8px; color: #fff; font-size: 15px; }
@@ -193,6 +193,7 @@ pre { margin: 0; min-height: 175px; max-height: 310px; overflow: auto; padding: 
 .switch span::after { content: ""; position: absolute; width: 15px; height: 15px; top: 2px; left: 2px; border-radius: 50%; background: #fff; box-shadow: 0 1px 4px rgba(0,0,0,.15); transition: .2s; }
 .switch input:checked + span { background: var(--coral); }
 .switch input:checked + span::after { transform: translateX(15px); }
+.current-headless-control { margin: 12px 18px 4px; }
 .creator-list { padding: 17px 19px 20px; display: grid; gap: 12px; }
 .creator-card { border: 1px solid #e5e1db; border-radius: 11px; overflow: hidden; background: #fcfbf9; }
 .creator-card-head { padding: 11px 13px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #e9e5df; background: #f7f5f1; }
@@ -258,6 +259,63 @@ pre { margin: 0; min-height: 175px; max-height: 310px; overflow: auto; padding: 
 .toast { max-width: 360px; padding: 12px 14px; border-radius: 9px; color: #fff; background: #222428; box-shadow: 0 12px 32px rgba(0,0,0,.2); font-size: 10px; animation: enter .2s ease; }
 .toast.error { background: #bd4b43; }
 @keyframes enter { from { opacity: 0; transform: translateY(8px); } }
+
+.alert-strip { display: grid; gap: 8px; margin-bottom: 15px; }
+.alert-item { display: flex; align-items: center; gap: 10px; padding: 11px 14px; border-radius: 10px; background: #fff; border: 1px solid var(--line); font-size: 12px; color: var(--ink); }
+.alert-item.error { border-color: #f3c9c5; background: #fff6f5; }
+.alert-item.warn { border-color: #f4e2c4; background: #fdf8ef; }
+.alert-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
+.alert-item.error .alert-dot { background: var(--coral); }
+.alert-item.warn .alert-dot { background: var(--amber); }
+.alert-text { flex: 1; line-height: 1.5; }
+.alert-action { flex: none; border: 1px solid var(--coral); color: var(--coral); background: #fff; border-radius: 7px; padding: 5px 11px; font-size: 11px; font-weight: 700; }
+.alert-action:hover { background: var(--coral); color: #fff; }
+
+.side-panel { display: grid; gap: 15px; align-content: start; }
+.panel-block { border: 1px solid var(--line); border-radius: 13px; background: var(--panel); box-shadow: var(--shadow); overflow: hidden; }
+.panel-block .panel-header.compact { border-bottom: 1px solid #eeebe6; }
+
+.account-detail-list { padding: 8px 16px 14px; display: grid; gap: 8px; }
+.account-detail-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 0; border-bottom: 1px solid #f0ede9; }
+.account-detail-row:last-child { border-bottom: 0; }
+.account-detail-id { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.account-state-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
+.account-state-dot.ready { background: var(--green); }
+.account-state-dot.running { background: var(--blue); }
+.account-state-dot.failed, .account-state-dot.missing { background: var(--coral); }
+.account-detail-meta { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }
+.account-detail-meta small { color: var(--muted); font-size: 10px; }
+
+.health-stats { padding: 9px 20px; display: grid; gap: 0; }
+.health-stats div { display: flex; justify-content: space-between; gap: 15px; padding: 11px 0; border-bottom: 1px solid #f0ede9; font-size: 11px; }
+.health-stats div:last-child { border-bottom: 0; }
+.health-stats span { color: var(--muted); }
+.health-stats strong { font-weight: 700; }
+.health-headline { margin: 0; padding: 0 20px 16px; font-size: 11px; line-height: 1.6; color: #4b4e54; }
+
+.channel-list { padding: 14px 20px 18px; display: flex; flex-wrap: wrap; gap: 8px; }
+.channel-chip { font-size: 11px; font-weight: 700; padding: 5px 11px; border-radius: 999px; border: 1px solid var(--line); }
+.channel-chip.on { color: var(--green); background: #eaf8f2; border-color: #cdeee1; }
+.channel-chip.off { color: var(--muted); background: #f6f5f3; }
+
+.funnel-panel { margin-top: 15px; }
+.funnel-bars { padding: 14px 20px 6px; display: grid; gap: 11px; }
+.funnel-row { display: grid; grid-template-columns: 84px minmax(0, 1fr) 64px; align-items: center; gap: 12px; }
+.funnel-label { font-size: 12px; color: #4b4e54; }
+.funnel-track { height: 9px; border-radius: 999px; background: #f0ede9; overflow: hidden; }
+.funnel-track.small { height: 7px; }
+.funnel-fill { height: 100%; border-radius: 999px; background: var(--green); transition: width .4s ease; }
+.funnel-fill.partial { background: var(--amber); }
+.funnel-fill.empty { background: #e7b7b2; }
+.funnel-count { font-size: 11px; color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; }
+.funnel-detail { padding: 4px 20px 16px; }
+.funnel-detail summary { cursor: pointer; font-size: 11px; color: var(--blue); padding: 6px 0; }
+.funnel-creators { padding: 8px 0 0; display: grid; gap: 9px; }
+.funnel-creator-row { display: grid; grid-template-columns: 140px minmax(0, 1fr) 84px; align-items: center; gap: 12px; }
+.funnel-creator-name { font-size: 11px; color: #4b4e54; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.funnel-creator-count { font-size: 10px; color: var(--muted); text-align: right; }
+
+.button.small { padding: 6px 11px; font-size: 11px; }
 
 @media (max-width: 1100px) {
   .metric-grid { grid-template-columns: repeat(2, 1fr); }

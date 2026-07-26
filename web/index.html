@@ -64,30 +64,44 @@
         <section class="tab-page active" id="tab-overview">
           <div class="notice hidden" id="status-error" role="alert"></div>
 
+          <div class="alert-strip hidden" id="overview-alerts" aria-live="polite"></div>
+
           <div class="metric-grid">
             <article class="metric-card coral">
               <div class="metric-icon">⌁</div>
-              <div class="metric-label">监控规模</div>
+              <div class="metric-label">监控达人</div>
               <div class="metric-value" id="metric-creators">—</div>
               <div class="metric-note" id="metric-creators-note">正在汇总达人数据</div>
             </article>
             <article class="metric-card blue">
+              <div class="metric-icon">▦</div>
+              <div class="metric-label">已采集作品</div>
+              <div class="metric-value" id="metric-works">—</div>
+              <div class="metric-note" id="metric-works-note">跨各达人主页</div>
+            </article>
+            <article class="metric-card violet">
               <div class="metric-icon">↗</div>
               <div class="metric-label">待处理作品</div>
               <div class="metric-value" id="metric-pending">—</div>
-              <div class="metric-note">等待转写、回写或备份</div>
-            </article>
-            <article class="metric-card violet">
-              <div class="metric-icon">◎</div>
-              <div class="metric-label">近期运行成功率</div>
-              <div class="metric-value" id="metric-history-rate">—</div>
-              <div class="metric-note" id="metric-history-note">正在读取历史记录</div>
+              <div class="metric-note">等待转写 / 总结 / 回写 / 备份</div>
             </article>
             <article class="metric-card green">
               <div class="metric-icon">◫</div>
               <div class="metric-label">账号池</div>
               <div class="metric-value" id="metric-accounts">—</div>
-              <div class="metric-note">本地登录文件检测</div>
+              <div class="metric-note" id="metric-accounts-note">本地登录文件检测</div>
+            </article>
+            <article class="metric-card amber">
+              <div class="metric-icon">%</div>
+              <div class="metric-label">近30次运行成功率</div>
+              <div class="metric-value" id="metric-history-rate">—</div>
+              <div class="metric-note" id="metric-history-note">正在读取历史记录</div>
+            </article>
+            <article class="metric-card blue">
+              <div class="metric-icon">◷</div>
+              <div class="metric-label">上次成功运行</div>
+              <div class="metric-value" id="metric-last-success">—</div>
+              <div class="metric-note" id="metric-last-success-note">最近一次成功执行</div>
             </article>
           </div>
 
@@ -119,25 +133,65 @@
               </div>
             </section>
 
-            <section class="panel schedule-panel">
-              <div class="panel-header compact">
-                <div>
-                  <p class="panel-kicker">PROJECT HEALTH</p>
-                  <h2>历史运行概况</h2>
+            <section class="panel side-panel">
+              <div class="panel-block">
+                <div class="panel-header compact">
+                  <div>
+                    <p class="panel-kicker">ACCOUNT POOL</p>
+                    <h2>账号池明细</h2>
+                  </div>
+                </div>
+                <div class="account-detail-list" id="overview-account-list">
+                  <div class="empty-cell">正在读取账号池…</div>
                 </div>
               </div>
-              <div class="schedule-list">
-                <div><span>统计运行次数</span><strong id="overview-history-total">—</strong></div>
-                <div><span>成功次数</span><strong id="overview-history-success">—</strong></div>
-                <div><span>异常次数</span><strong id="overview-history-issues">—</strong></div>
-                <div><span>最近一次成功</span><strong id="overview-latest-success">—</strong></div>
+
+              <div class="panel-block">
+                <div class="panel-header compact">
+                  <div>
+                    <p class="panel-kicker">PROJECT HEALTH</p>
+                    <h2>项目健康</h2>
+                  </div>
+                </div>
+                <div class="health-stats">
+                  <div><span>统计运行次数</span><strong id="overview-history-total">—</strong></div>
+                  <div><span>成功次数</span><strong id="overview-history-success">—</strong></div>
+                  <div><span>异常次数</span><strong id="overview-history-issues">—</strong></div>
+                  <div><span>最近一次成功</span><strong id="overview-latest-success">—</strong></div>
+                </div>
+                <p class="health-headline" id="overview-health-headline">正在读取最近运行…</p>
               </div>
-              <div class="schedule-hint">
-                <span>i</span>
-                这里只展示项目累计情况；当次执行请前往“当前任务”。
+
+              <div class="panel-block">
+                <div class="panel-header compact">
+                  <div>
+                    <p class="panel-kicker">DOWNSTREAM</p>
+                    <h2>下游通道</h2>
+                  </div>
+                </div>
+                <div class="channel-list" id="overview-channels">
+                  <div class="empty-cell">正在读取配置…</div>
+                </div>
               </div>
             </section>
           </div>
+
+          <section class="panel funnel-panel">
+            <div class="panel-header compact">
+              <div>
+                <p class="panel-kicker">PROCESSING FUNNEL</p>
+                <h2>作品处理漏斗</h2>
+              </div>
+              <span class="panel-meta" id="funnel-total">—</span>
+            </div>
+            <div class="funnel-bars" id="funnel-bars">
+              <div class="empty-cell">正在读取处理状态…</div>
+            </div>
+            <details class="funnel-detail">
+              <summary>按达人查看总结进度</summary>
+              <div class="funnel-creators" id="funnel-creators"></div>
+            </details>
+          </section>
         </section>
 
         <section class="tab-page" id="tab-current">
@@ -207,6 +261,16 @@
                 <div><span>本轮开始</span><strong id="schedule-start">—</strong></div>
                 <div><span>下次触发</span><strong id="schedule-next">—</strong></div>
                 <div><span>触发方式</span><strong>Windows 任务计划</strong></div>
+              </div>
+              <div class="current-headless-control switch-field">
+                <div>
+                  <strong>使用无头浏览器</strong>
+                  <small>关闭后采集会打开可见 Chrome，便于观察过程，也可能降低账号被限制概率。</small>
+                </div>
+                <label class="switch">
+                  <input type="checkbox" id="headless-toggle">
+                  <span></span>
+                </label>
               </div>
               <div class="schedule-hint">
                 <span>i</span>

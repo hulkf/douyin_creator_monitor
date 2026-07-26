@@ -7,7 +7,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "web_dashboard.py"
@@ -140,7 +140,7 @@ class WebDashboardConfigTests(unittest.TestCase):
                 / "Cookies"
             )
             cookie.parent.mkdir(parents=True)
-            cookie.write_bytes(b"x" * WEB.GUI.VALID_LOGIN_MIN_BYTES)
+            cookie.write_bytes(b"x" * (WEB.VALID_LOGIN_MIN_BYTES + 1))
 
             payload = WEB.account_pool_payload(root)
 
@@ -176,6 +176,74 @@ class WebDashboardConfigTests(unittest.TestCase):
         finally:
             WEB._ACCOUNT_LOGIN_PROCESSES.clear()
 
+    def test_successful_main_login_immediately_refreshes_creator_replicas(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "config").mkdir()
+            (root / "local").mkdir()
+            config = valid_config(creators=[valid_creator("creator-a")])
+            config["collection"] = {
+                "account_profiles": ["account-a", "account-b"],
+                "per_creator_profile_pool": True,
+                "media_crawler_dir": str(root / "MediaCrawler"),
+            }
+            for path in (
+                root / "config" / "pipeline.example.json",
+                root / "local" / "pipeline.json",
+            ):
+                path.write_text(json.dumps(config), encoding="utf-8")
+            process = Mock()
+            process.wait.return_value = 0
+            refresh_result = {
+                "source_profiles": ["account-a"],
+                "refreshed": ["creator-a"],
+                "unchanged": [],
+                "unavailable_sources": [],
+                "busy_profiles": [],
+            }
+
+            with patch.object(
+                WEB.PIPELINE,
+                "refresh_primary_profile_replicas",
+                return_value=refresh_result,
+            ) as refresh:
+                WEB.refresh_replicas_after_account_login(
+                    "account-a", process, root,
+                )
+
+            refresh.assert_called_once()
+            marker = json.loads(
+                (root / "runtime" / "account-login" / "account-a"
+                 / "login_state.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(marker["replica_refresh"]["status"], "success")
+
+    def test_successful_backup_login_does_not_replace_main_replicas(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "config").mkdir()
+            (root / "local").mkdir()
+            config = valid_config(creators=[valid_creator("creator-a")])
+            config["collection"] = {
+                "account_profiles": ["account-a", "account-b"],
+            }
+            for path in (
+                root / "config" / "pipeline.example.json",
+                root / "local" / "pipeline.json",
+            ):
+                path.write_text(json.dumps(config), encoding="utf-8")
+            process = Mock()
+            process.wait.return_value = 0
+
+            with patch.object(
+                WEB.PIPELINE, "refresh_primary_profile_replicas",
+            ) as refresh:
+                WEB.refresh_replicas_after_account_login(
+                    "account-b", process, root,
+                )
+
+            refresh.assert_not_called()
+
 
 class WebDashboardPayloadTests(unittest.TestCase):
     def test_snapshot_payload_converts_dates_and_paths_for_json(self):
@@ -191,7 +259,7 @@ class WebDashboardPayloadTests(unittest.TestCase):
             account_profiles_total=2,
             account_profiles_detected=1,
             latest_log=Path("pipeline.log"),
-            log_tail="done",
+            log_tail="[2026-07-24 18:30:00] 流水线开始",
             refreshed_at=now,
         )
 
@@ -200,9 +268,11 @@ class WebDashboardPayloadTests(unittest.TestCase):
         self.assertEqual(payload["task"]["state"], "Ready")
         self.assertEqual(payload["latest_run"]["finished_at"], now.isoformat())
         self.assertEqual(payload["creators"][0]["name"], "达人 A")
-        self.assertIsNone(payload["latest_log"])
-        self.assertEqual(payload["activity_events"], [])
-        self.assertEqual(payload["log_tail"], "当前没有正在执行的任务。")
+        # Non-running tasks still expose the latest log and events so the web
+        # dashboard can keep showing the last run's results until refreshed.
+        self.assertEqual(payload["latest_log"], "pipeline.log")
+        self.assertEqual(payload["log_tail"], "[2026-07-24 18:30:00] 流水线开始")
+        self.assertEqual(payload["activity_events"][0]["message"], "流水线已启动")
         json.dumps(payload)
 
         running_payload = WEB.snapshot_payload(snapshot._replace(
@@ -341,6 +411,15 @@ class WebDashboardStaticTests(unittest.TestCase):
         self.assertNotIn('key: "ima"', javascript)
         self.assertNotIn('key: "kuake"', javascript)
         self.assertNotIn('key: "obsidian"', javascript)
+
+    def test_account_pool_ui_explains_ordered_primary_and_backup_roles(self):
+        project_dir = Path(__file__).resolve().parents[1]
+        javascript = (project_dir / "web" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn("列表第一项永远是主账号", javascript)
+        self.assertIn("新的第一项自动成为主账号", javascript)
+        self.assertIn('"账号槽位名称 · 主账号"', javascript)
+        self.assertIn("`账号槽位名称 · 备用账号 ${index}`", javascript)
 
 
 class WebDashboardHttpTests(unittest.TestCase):
