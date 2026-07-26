@@ -1,5 +1,6 @@
 import argparse
 import importlib.util
+import json
 import sys
 import tempfile
 import threading
@@ -111,6 +112,96 @@ class CreatorOnboardingTest(unittest.TestCase):
             second.write_text("b", encoding="utf-8")
             index = SUPPLEMENT.index_creator_notes(root, "达人")
         self.assertEqual(index, {"123": first, "456": second})
+
+    def test_supplement_child_scripts_force_utf8_output(self):
+        completed = Mock(returncode=0, stdout="", stderr="")
+        with patch.object(SUPPLEMENT.subprocess, "run", return_value=completed) as run:
+            result = SUPPLEMENT.run_script("feishu_work_status_writer.py")
+
+        self.assertIs(result, completed)
+        kwargs = run.call_args.kwargs
+        self.assertEqual(kwargs["encoding"], "utf-8")
+        self.assertEqual(kwargs["errors"], "replace")
+        self.assertEqual(kwargs["env"]["PYTHONIOENCODING"], "utf-8")
+
+    def test_existing_summary_reconciles_stale_missing_marker_and_feishu_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            works_file = root / "works.json"
+            works_file.write_text(
+                json.dumps({"works": [{"aweme_id": "1", "title": "work"}]}),
+                encoding="utf-8",
+            )
+            transcript = root / "1.txt"
+            transcript.write_text("transcript", encoding="utf-8")
+            summary_output = root / "1-summary.md"
+            notes = root / "notes" / "creator-a"
+            notes.mkdir(parents=True)
+            (notes / "2026-01-01_1_work.md").write_text(
+                "# work\n\n## 内容总结\n\n已有总结\n",
+                encoding="utf-8",
+            )
+            state_path = root / "state" / "creator-a" / "1.json"
+            state_path.parent.mkdir(parents=True)
+            state_path.write_text(
+                json.dumps({
+                    "aweme_id": "1",
+                    "stages": {
+                        "summarized": {"status": SUPPLEMENT.SUMMARY_TEMPLATE_MISSING},
+                    },
+                }),
+                encoding="utf-8",
+            )
+            prompt = root / "prompt.md"
+            prompt.write_text("prompt", encoding="utf-8")
+            config = {
+                "state_dir": str(root / "state"),
+                "media_dir": str(root / "media"),
+                "obsidian": {
+                    "enabled": True,
+                    "original_dir": str(root / "notes"),
+                },
+                "summary": {"enabled": True},
+            }
+            creator = {
+                "key": "creator-a",
+                "creator_name": "Creator A",
+                "creator_dir_name": "creator-a",
+                "works_file": str(works_file),
+                "works_table_id": "table-a",
+            }
+            args = argparse.Namespace(
+                force=False,
+                dry_run=False,
+                no_feishu=False,
+                _summary_capability="llm",
+            )
+            with patch.object(SUPPLEMENT, "hydrate_creator_type"), patch.object(
+                SUPPLEMENT.pipe, "select_summary_template_file", return_value=prompt,
+            ), patch.object(
+                SUPPLEMENT.pipe, "summary_capability", return_value="none",
+            ), patch.object(
+                SUPPLEMENT.pipe,
+                "artifact_paths",
+                return_value={"final": transcript, "summary": summary_output},
+            ), patch.object(
+                SUPPLEMENT, "generate_summary",
+            ) as generate, patch.object(
+                SUPPLEMENT, "write_feishu_local_status", return_value=True,
+            ) as write_status:
+                counters = SUPPLEMENT.supplement_creator(config, creator, args)
+
+            self.assertEqual(counters["reconciled"], 1)
+            self.assertEqual(counters["skipped"], 0)
+            generate.assert_not_called()
+            write_status.assert_called_once_with(
+                table_id="table-a",
+                aweme_id="1",
+                local_status="已写入",
+                dry_run=False,
+            )
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(state["stages"]["summarized"]["status"], "success")
 
     def test_pipeline_supplement_propagates_child_failure(self):
         with tempfile.TemporaryDirectory() as directory:

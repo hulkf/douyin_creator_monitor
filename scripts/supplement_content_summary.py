@@ -118,7 +118,16 @@ def run_script(script_name: str, *args: str, dry_run: bool = False) -> subproces
     if dry_run:
         print(f"    [dry-run] {subprocess.list2cmdline(command)}")
         return subprocess.CompletedProcess(command, 0, "", "")
-    return subprocess.run(command, capture_output=True, text=True, encoding="utf-8")
+    child_env = os.environ.copy()
+    child_env["PYTHONIOENCODING"] = "utf-8"
+    return subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=child_env,
+    )
 
 
 def generate_summary(
@@ -225,7 +234,7 @@ def title_of(work: dict[str, Any]) -> str:
 def supplement_creator(
     config: dict[str, Any], creator: dict[str, Any], args: argparse.Namespace,
 ) -> dict[str, int]:
-    counters = {"supplemented": 0, "skipped": 0, "failed": 0}
+    counters = {"supplemented": 0, "reconciled": 0, "skipped": 0, "failed": 0}
     key = pipe.creator_key(creator)
 
     # 触发条件 (b)：该达人应补充（配置了总结模板）。先注入飞书达人类型再解析模板，
@@ -242,9 +251,10 @@ def supplement_creator(
 
     # 触发条件 (c)：当前具备模型能力
     capability = pipe.summary_capability(config, args)
-    if capability != "llm":
+    if capability != "llm" and args.force:
         print(f"[拒绝] 达人 {key}：当前不具备模型能力（summary.model 未配置），无法补充内容总结。"
               f"请先在 pipeline.json 的 summary 段配置模型后重试。")
+        counters["failed"] += 1
         return counters
 
     works_file = pipe.path_from(creator.get("works_file"))
@@ -289,11 +299,38 @@ def supplement_creator(
         # 触发条件 (a)：识别到笔记缺失 ## 内容总结 模块
         note = note_index.get(aweme_id)
         if note is not None and note_has_summary(note) and not args.force:
-            counters["skipped"] += 1
+            state_path = state_dir / key / f"{pipe.safe_key(aweme_id)}.json"
+            state = pipe.load_state(state_path, creator, work)
+            if pipe.status_of(state, "summarized") != SUMMARY_TEMPLATE_MISSING:
+                counters["skipped"] += 1
+                continue
+            if table_id and not args.no_feishu and not write_feishu_local_status(
+                table_id=table_id,
+                aweme_id=aweme_id,
+                local_status="已写入",
+                dry_run=args.dry_run,
+            ):
+                counters["failed"] += 1
+                print(f"  - 对账失败 {aweme_id}：飞书状态回写失败")
+                continue
+            pipe.set_status(
+                state,
+                "summarized",
+                "success",
+                "内容总结模块已存在，状态已对账",
+            )
+            if not args.dry_run:
+                pipe.write_json(state_path, state)
+            counters["reconciled"] += 1
+            print(f"  = 对账 {aweme_id}：笔记已有内容总结，状态已更新")
             continue
 
         print(f"  + 补充 {aweme_id}（{title_of(work)}）…", end="", flush=True)
         try:
+            if capability != "llm":
+                counters["failed"] += 1
+                print(f" 补充失败：summary.model 未配置")
+                continue
             if not generate_summary(
                 transcript=transcript, template_file=summary_template_file, output=paths["summary"],
                 creator_name=creator_name, title=title_of(work), aweme_id=aweme_id,
@@ -371,16 +408,19 @@ def main(argv: list[str] | None = None) -> int:
         print("没有需要处理的达人。")
         return 0
 
-    total = {"supplemented": 0, "skipped": 0, "failed": 0}
+    total = {"supplemented": 0, "reconciled": 0, "skipped": 0, "failed": 0}
     for creator in creators:
         try:
             counters = supplement_creator(config, creator, args)
         except Exception as exc:
             print(f"[异常] 达人 {pipe.creator_key(creator)}：{exc}", file=sys.stderr)
-            counters = {"supplemented": 0, "skipped": 0, "failed": 1}
+            counters = {"supplemented": 0, "reconciled": 0, "skipped": 0, "failed": 1}
         for k in total:
             total[k] += counters.get(k, 0)
-    print(f"\n汇总：补充 {total['supplemented']} 篇，跳过 {total['skipped']} 篇，失败 {total['failed']} 篇。")
+    print(
+        f"\n汇总：补充 {total['supplemented']} 篇，对账 {total['reconciled']} 篇，"
+        f"跳过 {total['skipped']} 篇，失败 {total['failed']} 篇。"
+    )
     return 1 if total["failed"] else 0
 
 

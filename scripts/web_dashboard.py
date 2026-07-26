@@ -28,6 +28,11 @@ if str(SCRIPT_DIR) not in sys.path:
 
 import gui_dashboard as GUI  # noqa: E402
 import run_creator_pipeline as PIPELINE  # noqa: E402
+from collect_douyin_creator_with_mediacrawler import (  # noqa: E402
+    close_new_blank_chrome_windows,
+    find_unrelated_user_chrome_pids,
+    visible_blank_chrome_windows,
+)
 
 
 CONFIG_RELATIVE_PATH = Path("local") / "pipeline.json"
@@ -1024,6 +1029,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def open_dashboard_without_blank(
+    url: str,
+    *,
+    opener: Callable[[str], bool] = webbrowser.open,
+) -> bool:
+    """Open the dashboard while removing only a blank created by Chrome handoff."""
+
+    user_chrome_pids = find_unrelated_user_chrome_pids()
+    existing_blank_handles = set(visible_blank_chrome_windows(user_chrome_pids))
+    try:
+        return bool(opener(url))
+    finally:
+        close_new_blank_chrome_windows(existing_blank_handles, user_chrome_pids)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if not 1 <= args.port <= 65535:
@@ -1033,7 +1053,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"抖音达人监控 Web 控制台：{url}", flush=True)
     print("按 Ctrl+C 停止本地服务。", flush=True)
     if not args.no_browser:
-        threading.Timer(0.4, webbrowser.open, args=(url,)).start()
+        threading.Timer(0.4, open_dashboard_without_blank, args=(url,)).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -378,6 +378,14 @@ class WebDashboardPayloadTests(unittest.TestCase):
 
 
 class WebDashboardStaticTests(unittest.TestCase):
+    def test_finished_run_uses_structured_creator_status_not_truncated_log_events(self):
+        project_dir = Path(__file__).resolve().parents[1]
+        javascript = (project_dir / "web" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn("const useFinalRunStatus", javascript)
+        self.assertIn('creator.status === "success"', javascript)
+        self.assertIn("useFinalRunStatus ? creator.detail", javascript)
+
     def test_config_page_uses_category_navigation_and_one_content_panel(self):
         project_dir = Path(__file__).resolve().parents[1]
         html = (project_dir / "web" / "index.html").read_text(encoding="utf-8")
@@ -420,6 +428,25 @@ class WebDashboardStaticTests(unittest.TestCase):
         self.assertIn("新的第一项自动成为主账号", javascript)
         self.assertIn('"账号槽位名称 · 主账号"', javascript)
         self.assertIn("`账号槽位名称 · 备用账号 ${index}`", javascript)
+
+
+class WebDashboardBrowserLaunchTests(unittest.TestCase):
+    def test_open_dashboard_closes_only_new_blank_windows_in_existing_user_chrome(self):
+        opener = Mock(return_value=True)
+        with patch.object(
+            WEB, "find_unrelated_user_chrome_pids", return_value={10, 20},
+        ) as find_pids, patch.object(
+            WEB, "visible_blank_chrome_windows", return_value={100: 10},
+        ) as list_blanks, patch.object(
+            WEB, "close_new_blank_chrome_windows", return_value={101},
+        ) as close_blanks:
+            result = WEB.open_dashboard_without_blank("http://127.0.0.1:8765/", opener=opener)
+
+        self.assertTrue(result)
+        find_pids.assert_called_once_with()
+        list_blanks.assert_called_once_with({10, 20})
+        opener.assert_called_once_with("http://127.0.0.1:8765/")
+        close_blanks.assert_called_once_with({100}, {10, 20})
 
 
 class WebDashboardHttpTests(unittest.TestCase):

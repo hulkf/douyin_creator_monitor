@@ -317,7 +317,10 @@ function renderStatus(data) {
   const currentBody = el("current-creator-table-body");
   currentBody.replaceChildren();
   const hasEvents = events.length > 0;
-  const currentCreators = (running || hasEvents) ? data.creators : [];
+  const useFinalRunStatus = !running
+    && ["success", "partial_failure", "failed"].includes(String(data.latest_run?.status || ""));
+  const showCurrentRun = running || useFinalRunStatus || hasEvents;
+  const currentCreators = showCurrentRun ? data.creators : [];
   let currentSuccess = 0;
   let currentFailed = 0;
   let currentActive = 0;
@@ -329,7 +332,10 @@ function renderStatus(data) {
     const latestEvent = creatorEvents[creatorEvents.length - 1];
     const finalEvent = [...creatorEvents].reverse().find((event) => String(event.message || "").includes("达人结束"));
     let currentStatus = "planned";
-    if (finalEvent?.level === "failed") currentStatus = "failed";
+    if (useFinalRunStatus) {
+      if (creator.status === "success") currentStatus = "success";
+      else if (["failed", "partial_failure"].includes(creator.status)) currentStatus = "failed";
+    } else if (finalEvent?.level === "failed") currentStatus = "failed";
     else if (finalEvent?.level === "success") currentStatus = "success";
     else if (latestEvent) currentStatus = "running";
     if (currentStatus === "success") currentSuccess += 1;
@@ -344,7 +350,11 @@ function renderStatus(data) {
     badge.textContent = currentStatus === "planned" ? "等待中" : statusText(currentStatus);
     statusCell.append(badge); row.append(statusCell);
     const detail = document.createElement("td");
-    detail.textContent = finalEvent?.message || latestEvent?.message || "等待本轮开始处理";
+    let currentDetail = useFinalRunStatus ? creator.detail : (finalEvent?.message || latestEvent?.message);
+    if (!currentDetail && useFinalRunStatus && currentStatus !== "planned") {
+      currentDetail = `达人结束: ${creator.name}，状态 ${creator.status}`;
+    }
+    detail.textContent = currentDetail || "等待本轮开始处理";
     row.append(detail);
     currentBody.append(row);
   });
@@ -354,11 +364,11 @@ function renderStatus(data) {
     row.append(cell); currentBody.append(row);
   }
   const finishedCreators = currentSuccess + currentFailed;
-  el("current-creator-result").textContent = (running || hasEvents) ? `${finishedCreators} / ${data.total_creators}` : "—";
-  el("current-creator-result-note").textContent = running ? "已结束 / 全部达人" : hasEvents ? "最近一次运行已结束" : "等待任务开始";
+  el("current-creator-result").textContent = showCurrentRun ? `${finishedCreators} / ${data.total_creators}` : "—";
+  el("current-creator-result-note").textContent = running ? "已结束 / 全部达人" : showCurrentRun ? "最近一次运行已结束" : "等待任务开始";
   el("current-creator-summary").textContent = running
     ? `${currentSuccess} 正常 · ${currentFailed} 异常 · ${currentActive} 等待或进行中`
-    : hasEvents
+    : showCurrentRun
     ? `${currentSuccess} 正常 · ${currentFailed} 异常`
     : "当前任务待命";
 
