@@ -190,7 +190,11 @@ class SummaryTemplateSelectionTest(unittest.TestCase):
         command = PIPELINE.summary_command(
             {
                 "python": "python",
-                "summary": {"model": "gpt-test", "api_key_env": "SUMMARY_KEY"},
+                "summary": {
+                    "model": "gpt-test",
+                    "api_key_env": "SUMMARY_KEY",
+                    "thinking": "disabled",
+                },
             },
             {"creator_name": "知了"},
             {"aweme_id": "123", "desc": "千川素材不消耗，怎么办"},
@@ -202,6 +206,7 @@ class SummaryTemplateSelectionTest(unittest.TestCase):
         self.assertEqual(command[command.index("--template-file") + 1], "qianchuan.md")
         self.assertEqual(command[command.index("--output") + 1], "123.summary.md")
         self.assertEqual(command[command.index("--model") + 1], "gpt-test")
+        self.assertEqual(command[command.index("--thinking") + 1], "disabled")
 
     def test_process_downstream_generates_summary_before_obsidian_export(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -403,6 +408,39 @@ class GenerateTranscriptSummaryTest(unittest.TestCase):
 
         self.assertEqual(value, "重试成功")
         self.assertEqual(urlopen.call_count, 2)
+
+    def test_truncated_reasoning_response_retries_with_more_tokens_and_thinking_disabled(self):
+        truncated = Mock()
+        truncated.read.return_value = json.dumps({
+            "choices": [{
+                "finish_reason": "length",
+                "message": {"content": "", "reasoning_content": "思考耗尽预算"},
+            }]
+        }, ensure_ascii=False).encode("utf-8")
+        truncated.__enter__ = Mock(return_value=truncated)
+        truncated.__exit__ = Mock(return_value=False)
+        complete = Mock()
+        complete.read.return_value = json.dumps({
+            "choices": [{"finish_reason": "stop", "message": {"content": "完整总结"}}]
+        }, ensure_ascii=False).encode("utf-8")
+        complete.__enter__ = Mock(return_value=complete)
+        complete.__exit__ = Mock(return_value=False)
+
+        with patch.object(
+            SUMMARY.urllib.request, "urlopen", side_effect=[truncated, complete],
+        ) as urlopen, patch.object(SUMMARY.time, "sleep"):
+            value = SUMMARY.request_chat_completion(
+                messages=[], model="m", api_key="k", base_url="https://example.invalid/v1",
+                temperature=0.2, max_tokens=100, timeout=1, max_attempts=3,
+                thinking="disabled",
+            )
+
+        first_payload = json.loads(urlopen.call_args_list[0].args[0].data)
+        second_payload = json.loads(urlopen.call_args_list[1].args[0].data)
+        self.assertEqual(value, "完整总结")
+        self.assertEqual(first_payload["thinking"], {"type": "disabled"})
+        self.assertEqual(first_payload["max_tokens"], 100)
+        self.assertEqual(second_payload["max_tokens"], 1124)
 
 
 if __name__ == "__main__":

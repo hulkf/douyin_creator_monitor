@@ -150,6 +150,12 @@ def generate_summary(
         args += ["--max-tokens", str(summary_cfg["max_tokens"])]
     if summary_cfg.get("timeout") not in (None, ""):
         args += ["--timeout", str(summary_cfg["timeout"])]
+    if summary_cfg.get("retry_attempts") not in (None, ""):
+        args += ["--retry-attempts", str(summary_cfg["retry_attempts"])]
+    if summary_cfg.get("thinking") not in (None, ""):
+        args += ["--thinking", str(summary_cfg["thinking"])]
+    if summary_cfg.get("retry_base_seconds") not in (None, ""):
+        args += ["--retry-base-seconds", str(summary_cfg["retry_base_seconds"])]
     result = run_script(*args, dry_run=dry_run)
     if dry_run:
         return True
@@ -287,40 +293,45 @@ def supplement_creator(
             continue
 
         print(f"  + 补充 {aweme_id}（{title_of(work)}）…", end="", flush=True)
-        if not generate_summary(
-            transcript=transcript, template_file=summary_template_file, output=paths["summary"],
-            creator_name=creator_name, title=title_of(work), aweme_id=aweme_id,
-            summary_cfg=summary_cfg, dry_run=args.dry_run,
-        ):
-            counters["failed"] += 1
-            print(" 生成失败")
-            continue
-        if not merge_summary_into_note(
-            transcript=transcript, aweme_id=aweme_id, works_file=works_file,
-            creator_name=creator_name, creator_dir_name=creator_dir_name,
-            original_dir=original_dir, obsidian_template=obsidian_template,
-            summary_file=paths["summary"], dry_run=args.dry_run,
-        ):
-            counters["failed"] += 1
-            print(" 合并失败")
-            continue
-        # 更新状态文件：summarized -> success
-        state_path = state_dir / key / f"{pipe.safe_key(aweme_id)}.json"
-        state = pipe.load_state(state_path, creator, work)
-        pipe.set_status(state, "summarized", "success", "内容总结模块已补充")
-        if not args.dry_run:
-            pipe.write_json(state_path, state)
-        # 回写飞书「本地知识库状态」
-        if table_id:
-            if not write_feishu_local_status(
-                table_id=table_id, aweme_id=aweme_id,
-                local_status="已写入", dry_run=args.dry_run,
+        try:
+            if not generate_summary(
+                transcript=transcript, template_file=summary_template_file, output=paths["summary"],
+                creator_name=creator_name, title=title_of(work), aweme_id=aweme_id,
+                summary_cfg=summary_cfg, dry_run=args.dry_run,
             ):
                 counters["failed"] += 1
-                print(" 飞书状态回写失败")
+                print(" 生成失败")
                 continue
-        counters["supplemented"] += 1
-        print(" 完成")
+            if not merge_summary_into_note(
+                transcript=transcript, aweme_id=aweme_id, works_file=works_file,
+                creator_name=creator_name, creator_dir_name=creator_dir_name,
+                original_dir=original_dir, obsidian_template=obsidian_template,
+                summary_file=paths["summary"], dry_run=args.dry_run,
+            ):
+                counters["failed"] += 1
+                print(" 合并失败")
+                continue
+            # 更新状态文件：summarized -> success
+            state_path = state_dir / key / f"{pipe.safe_key(aweme_id)}.json"
+            state = pipe.load_state(state_path, creator, work)
+            pipe.set_status(state, "summarized", "success", "内容总结模块已补充")
+            if not args.dry_run:
+                pipe.write_json(state_path, state)
+            # 回写飞书「本地知识库状态」（--no-feishu 时跳过，常用于飞书读取被环境权限阻断的场景）
+            if table_id and not args.no_feishu:
+                if not write_feishu_local_status(
+                    table_id=table_id, aweme_id=aweme_id,
+                    local_status="已写入", dry_run=args.dry_run,
+                ):
+                    counters["failed"] += 1
+                    print(" 飞书状态回写失败")
+                    continue
+            counters["supplemented"] += 1
+            print(" 完成")
+        except Exception as exc:  # 单个作品异常不应中断整轮处理
+            counters["failed"] += 1
+            print(f" 异常: {exc}", file=sys.stderr)
+            continue
     return counters
 
 
@@ -333,6 +344,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--creator", action="append", default=[], help="指定达人 key（可多次）；不填则配合 --all 使用")
     parser.add_argument("--all", action="store_true", help="处理配置中所有启用的达人")
     parser.add_argument("--force", action="store_true", help="即使笔记已有 ## 内容总结 也重新生成")
+    parser.add_argument("--no-feishu", action="store_true", help="跳过飞书「本地知识库状态」回写（飞书读取被环境权限阻断时使用）")
     parser.add_argument("--dry-run", action="store_true", help="只打印将执行的命令，不调用模型、不写文件")
     return parser
 

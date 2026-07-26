@@ -36,6 +36,7 @@ DEFAULT_LOG_DIR = PROJECT_DIR / "logs"
 BEIJING_TZ = timezone(timedelta(hours=8))
 HASHTAG_RE = re.compile(r"#([^#\s]+)")
 INVALID_PATH_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_FEISHU_WRITE_LOCK = threading.Lock()
 STAGES = (
     "collected", "feishu_synced", "transcribed", "corrected",
     "summarized",
@@ -141,11 +142,24 @@ class Runner:
         self.logger.write(f"完成 {label}")
         return stdout
 
-
 def truncate(text: str, limit: int = 4000) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + f" ... <省略 {len(text) - limit} 个字符>"
+
+
+def run_feishu_write(
+    runner: Runner,
+    label: str,
+    command: list[str],
+    env: dict[str, str],
+    *,
+    sensitive: Iterable[str] = (),
+) -> str:
+    """Serialize Base mutations while creator collection remains concurrent."""
+
+    with _FEISHU_WRITE_LOCK:
+        return runner.run(label, command, env, sensitive=sensitive)
 
 
 def print_console(text: str, *, file: Any = None) -> None:
@@ -1206,6 +1220,8 @@ def summary_command(
         ("--max-tokens", "max_tokens"),
         ("--timeout", "timeout"),
         ("--retry-attempts", "retry_attempts"),
+        ("--thinking", "thinking"),
+        ("--retry-base-seconds", "retry_base_seconds"),
     ):
         append_option(command, option, chosen(creator, defaults, key))
     return command
@@ -1637,7 +1653,8 @@ def ensure_and_sync_mapping(
     runner: Runner, label: str, ensure_command: list[str], sync_command: list[str], env: dict[str, str],
 ) -> str:
     runner.run(f"确认{label}达人目录", ensure_command, env)
-    output = runner.run(
+    output = run_feishu_write(
+        runner,
         f"回写{label}目录映射到飞书", sync_command, env,
         sensitive=("--table-id", "--base-token", "--match-value"),
     )
@@ -1725,7 +1742,8 @@ def sync_creator_backup_mappings(
             })
     elif ready_metadata:
         try:
-            output = runner.run(
+            output = run_feishu_write(
+                runner,
                 "合并回写达人目录映射到飞书",
                 mapping_sync_command(config, creator, ready_metadata), env,
                 sensitive=("--table-id", "--base-token", "--match-value"),
@@ -2195,7 +2213,8 @@ def process_downstream(
 
     finalizer_started = time.perf_counter()
     try:
-        runner.run(
+        run_feishu_write(
+            runner,
             f"合并回写文案与备份状态 {work_id}",
             status_writeback_command(
                 config, creator, work, result["stages"], record_id, transcript_file,
@@ -2423,7 +2442,8 @@ def collect_creator_phase(
             logger.write(f"跳过飞书达人资料同步 {name}")
         else:
             try:
-                runner.run(
+                run_feishu_write(
+                    runner,
                     f"飞书达人资料同步 {name}",
                     profile_sync_command(config, creator, path_from(args.config)),
                     env,
@@ -2508,7 +2528,8 @@ def collect_creator_phase(
         logger.write(f"跳过飞书作品同步 {name}")
     else:
         try:
-            sync_output = runner.run(
+            sync_output = run_feishu_write(
+                runner,
                 f"飞书作品同步 {name}", sync_command(config, creator, sync_works_file), env,
                 sensitive=("--table-id", "--base-token"),
             )
@@ -2684,7 +2705,8 @@ def finalize_creator_batches(
         batch_results = {}
         batch_error = ""
         try:
-            output = runner.run(
+            output = run_feishu_write(
+                runner,
                 f"飞书最终结果批量写回 {creator_key(creator)} ({len(feishu_ids)}条)",
                 status_writeback_batch_command(config, creator, manifest_path), env,
                 sensitive=("--table-id", "--base-token"),

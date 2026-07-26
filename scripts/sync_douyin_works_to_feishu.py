@@ -15,6 +15,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
@@ -41,26 +42,47 @@ CORE_VERIFY_FIELDS = ("抖音作品ID", "发布时间", "点赞数", "评论数"
 
 MAX_BATCH_CREATE_RECORDS = 200
 MAX_BATCH_CREATE_JSON_CHARS = 20_000
+RETRYABLE_FEISHU_WRITE_CODES = {800004135, 1254290, 1254291}
+FEISHU_WRITE_ATTEMPTS = 5
+
+
+def retryable_feishu_write_error(payload: Any) -> bool:
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if not isinstance(error, dict):
+        return False
+    try:
+        code = int(error.get("code"))
+    except (TypeError, ValueError):
+        code = 0
+    message = str(error.get("message") or "").casefold()
+    return code in RETRYABLE_FEISHU_WRITE_CODES or (
+        "limited" in message or "write conflict" in message or "too many request" in message
+    )
 
 
 def run_lark(cli: str, args: list[str]) -> dict[str, Any]:
-    result = subprocess.run(
-        scoped_lark_command(cli, args),
-        cwd=PROJECT_DIR,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        capture_output=True,
-        env=isolated_lark_env(),
-    )
-    output = result.stdout if result.returncode == 0 else result.stderr or result.stdout
-    try:
-        payload = json.loads(output)
-    except json.JSONDecodeError as exc:
-        raise SystemExit(f"lark-cli did not return JSON: {output[:1000]}") from exc
-    if result.returncode != 0 or not payload.get("ok", False):
+    for attempt in range(FEISHU_WRITE_ATTEMPTS):
+        result = subprocess.run(
+            scoped_lark_command(cli, args),
+            cwd=PROJECT_DIR,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            env=isolated_lark_env(),
+        )
+        output = result.stdout if result.returncode == 0 else result.stderr or result.stdout
+        try:
+            payload = json.loads(output)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"lark-cli did not return JSON: {output[:1000]}") from exc
+        if result.returncode == 0 and payload.get("ok", False):
+            return payload
+        if retryable_feishu_write_error(payload) and attempt + 1 < FEISHU_WRITE_ATTEMPTS:
+            time.sleep(min(2 ** attempt, 8))
+            continue
         raise SystemExit(json.dumps(payload, ensure_ascii=False, indent=2))
-    return payload
+    raise SystemExit("Feishu write retry loop exhausted.")
 
 
 def beijing_time(epoch_seconds: int | float | None) -> str | None:

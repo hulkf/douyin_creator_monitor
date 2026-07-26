@@ -5,7 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
@@ -17,6 +17,33 @@ SPEC.loader.exec_module(SYNC)
 
 
 class FeishuWorkSyncTest(unittest.TestCase):
+    def test_limited_batch_write_is_retried(self):
+        limited = Mock(
+            returncode=1,
+            stdout="",
+            stderr=json.dumps({
+                "ok": False,
+                "identity": "user",
+                "error": {
+                    "code": 800004135,
+                    "message": "the method: OpenAPIBatchAddRecords limited",
+                },
+            }),
+        )
+        success = Mock(
+            returncode=0,
+            stdout=json.dumps({"ok": True, "identity": "user", "data": {}}),
+            stderr="",
+        )
+        with patch.object(
+            SYNC.subprocess, "run", side_effect=[limited, success],
+        ) as run, patch.object(SYNC.time, "sleep") as sleep:
+            payload = SYNC.run_lark("cli", ["base", "+record-batch-create"])
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(run.call_count, 2)
+        sleep.assert_called_once_with(1)
+
     def test_work_patch_only_uses_canonical_schema_fields(self):
         patch_value = SYNC.build_patch(
             {
@@ -56,6 +83,20 @@ class FeishuWorkSyncTest(unittest.TestCase):
         self.assertEqual(set(records), {"1", "2"})
         second_args = mocked.call_args_list[1].args[1]
         self.assertEqual(second_args[second_args.index("--offset") + 1], "200")
+
+    def test_existing_record_scan_uses_configured_bot_identity(self):
+        response = {
+            "data": {
+                "fields": ["抖音作品ID"],
+                "data": [["1"]],
+                "record_id_list": ["rec1"],
+                "has_more": False,
+            }
+        }
+        with patch.object(SYNC, "run_lark", return_value=response) as mocked:
+            SYNC.load_existing_records("cli", "base", "table", "bot")
+        command = mocked.call_args.args[1]
+        self.assertEqual(command[command.index("--as") + 1], "bot")
 
     def test_existing_record_scan_projects_only_sync_fields(self):
         response = {

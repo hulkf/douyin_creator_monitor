@@ -79,52 +79,81 @@ def request_chat_completion(
     max_tokens: int,
     timeout: float,
     max_attempts: int = 3,
+    thinking: str = "",
+    retry_base_seconds: float = 2.0,
 ) -> str:
     url = base_url.rstrip("/") + "/chat/completions"
-    payload: dict[str, Any] = {
-        "model": model,
-        "messages": messages,
-        "temperature": temperature,
-    }
-    if max_tokens > 0:
-        payload["max_tokens"] = max_tokens
-    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    request = urllib.request.Request(
-        url,
-        data=data,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-    )
     attempts = max(1, int(max_attempts))
-    body = ""
+    token_budget = max_tokens
     for attempt in range(attempts):
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+        }
+        if token_budget > 0:
+            payload["max_tokens"] = token_budget
+        if thinking in {"enabled", "disabled"}:
+            payload["thinking"] = {"type": thinking}
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+        )
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 body = response.read().decode("utf-8")
-            break
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:1000]
             transient = exc.code in {408, 409, 425, 429, 500, 502, 503, 504}
             if not transient or attempt + 1 >= attempts:
                 raise SummaryGenerationError(f"总结模型请求失败 HTTP {exc.code}: {detail}") from exc
+            retry_after = 0.0
+            try:
+                retry_after = float(exc.headers.get("Retry-After", "0") or 0)
+            except (TypeError, ValueError):
+                retry_after = 0.0
+            time.sleep(max(retry_after, min(retry_base_seconds * (2 ** attempt), 30.0)))
+            continue
         except urllib.error.URLError as exc:
             if attempt + 1 >= attempts:
                 raise SummaryGenerationError(f"总结模型请求失败: {exc}") from exc
-        time.sleep(min(2 ** attempt, 8))
+            time.sleep(min(retry_base_seconds * (2 ** attempt), 30.0))
+            continue
 
-    try:
-        payload = json.loads(body)
-        choices = payload.get("choices")
-        message = choices[0].get("message") if isinstance(choices, list) and choices else None
-        content = message.get("content") if isinstance(message, dict) else None
-    except (ValueError, AttributeError, IndexError) as exc:
-        raise SummaryGenerationError(f"总结模型返回格式异常: {body}") from exc
-    if not isinstance(content, str) or not content.strip():
-        raise SummaryGenerationError(f"总结模型返回空内容: {body}")
-    return content.strip("\ufeff\r\n")
+        try:
+            response_payload = json.loads(body)
+            choices = response_payload.get("choices")
+            choice = choices[0] if isinstance(choices, list) and choices else None
+            message = choice.get("message") if isinstance(choice, dict) else None
+            content = message.get("content") if isinstance(message, dict) else None
+            finish_reason = str(choice.get("finish_reason") or "") if isinstance(choice, dict) else ""
+        except (ValueError, AttributeError, IndexError) as exc:
+            raise SummaryGenerationError(f"总结模型返回格式异常: {body}") from exc
+
+        retryable_response = finish_reason in {"length", "network_error"} or not (
+            isinstance(content, str) and content.strip()
+        )
+        if retryable_response and attempt + 1 < attempts:
+            if finish_reason == "length" and token_budget > 0:
+                token_budget = min(max(token_budget * 2, token_budget + 1024), 32768)
+            time.sleep(min(retry_base_seconds * (2 ** attempt), 30.0))
+            continue
+        if finish_reason == "length":
+            raise SummaryGenerationError(
+                f"总结模型输出达到 token 上限（max_tokens={token_budget}），未生成完整内容。"
+            )
+        if finish_reason == "network_error":
+            raise SummaryGenerationError("总结模型返回 network_error。")
+        if not isinstance(content, str) or not content.strip():
+            raise SummaryGenerationError(f"总结模型返回空内容: {body}")
+        return content.strip("\ufeff\r\n")
+
+    raise SummaryGenerationError("总结模型请求未返回可用内容。")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -142,6 +171,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-tokens", type=int, default=int(os.environ.get("SUMMARY_LLM_MAX_TOKENS", "1800")))
     parser.add_argument("--timeout", type=float, default=float(os.environ.get("SUMMARY_LLM_TIMEOUT", "120")))
     parser.add_argument("--retry-attempts", type=int, default=int(os.environ.get("SUMMARY_LLM_RETRY_ATTEMPTS", "3")))
+    parser.add_argument(
+        "--thinking",
+        choices=["enabled", "disabled"],
+        default=os.environ.get("SUMMARY_LLM_THINKING", "") or None,
+        help="支持该参数的推理模型可显式开启或关闭思考模式",
+    )
+    parser.add_argument(
+        "--retry-base-seconds",
+        type=float,
+        default=float(os.environ.get("SUMMARY_LLM_RETRY_BASE_SECONDS", "2")),
+        help="429/网络错误与空响应重试的基础退避秒数",
+    )
     parser.add_argument("--dry-run", action="store_true", help="只打印将发送给模型的 messages JSON，不调用模型、不写 output")
     return parser
 
@@ -177,6 +218,8 @@ def main(argv: list[str] | None = None) -> int:
             max_tokens=args.max_tokens,
             timeout=args.timeout,
             max_attempts=args.retry_attempts,
+            thinking=args.thinking or "",
+            retry_base_seconds=args.retry_base_seconds,
         )
         args.output.parent.mkdir(parents=True, exist_ok=True)
         temporary = args.output.with_suffix(args.output.suffix + ".tmp")

@@ -6,6 +6,7 @@ import json
 import tempfile
 import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -17,6 +18,40 @@ SPEC.loader.exec_module(PIPELINE)
 
 
 class PipelineHelpersTest(unittest.TestCase):
+    def test_feishu_writes_are_serialized_across_creator_workers(self):
+        runner = PIPELINE.Runner(
+            PIPELINE.Logger(Path("unused.log"), persist=False),
+            dry_run=False,
+        )
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        overlap = threading.Event()
+        state_lock = threading.Lock()
+        active = 0
+
+        def fake_run(*_args, **_kwargs):
+            nonlocal active
+            with state_lock:
+                active += 1
+                if active > 1:
+                    overlap.set()
+            first_entered.set()
+            release_first.wait(timeout=1)
+            with state_lock:
+                active -= 1
+            return "ok"
+
+        with patch.object(runner, "run", side_effect=fake_run):
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                first = executor.submit(PIPELINE.run_feishu_write, runner, "a", [], {})
+                self.assertTrue(first_entered.wait(timeout=1))
+                second = executor.submit(PIPELINE.run_feishu_write, runner, "b", [], {})
+                self.assertFalse(overlap.wait(timeout=0.1))
+                release_first.set()
+                self.assertEqual(first.result(timeout=1), "ok")
+                self.assertEqual(second.result(timeout=1), "ok")
+        self.assertFalse(overlap.is_set())
+
     def test_feishu_only_status_ignores_reported_backup_failures(self):
         stages = {
             "feishu_written_back": "success",

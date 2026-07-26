@@ -57,7 +57,9 @@
     "temperature": 0.2,
     "max_tokens": 1800,
     "timeout": 120,
-    "retry_attempts": 3
+    "retry_attempts": 3,
+    "thinking": "",
+    "retry_base_seconds": 2
   },
   "backups": {
     "max_workers": 3,

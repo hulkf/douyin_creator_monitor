@@ -21,6 +21,16 @@ set PIPELINE=D:\JR_project\douyin_creator_monitor\scripts\run_creator_pipeline.p
 REM Keep redirected Python output UTF-8 for every stage, including reconcile.
 set PYTHONIOENCODING=utf-8
 
+REM ---- Load private secrets from local/.env (gitignored, never committed) ----
+REM Keeps API keys out of the repo while making them available to every stage
+REM (double-click OR Windows Task Scheduler), since the summary/LLM step reads
+REM its key from an environment variable named in pipeline.json -> summary.api_key_env.
+if exist "local\.env" (
+  for /f "usebackq tokens=1,* delims==" %%A in ("local\.env") do (
+    if not "%%A"=="" if not "%%A:~0,1"=="#" set "%%A=%%B"
+  )
+)
+
 REM ---- Isolate this project from unrelated Agent lark-cli workspaces. ----
 REM HERMES_HOME/OPENCLAW_HOME/LARK_CHANNEL make lark-cli auto-select that
 REM Agent's app. Clear them and pin the ordinary local lark-cli config root.
