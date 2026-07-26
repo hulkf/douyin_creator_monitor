@@ -1203,14 +1203,35 @@ class PipelineHelpersTest(unittest.TestCase):
             source_cookie.write_bytes(
                 b"a" * (PIPELINE.VALID_LOGIN_MIN_BYTES + 1)
             )
+            backup_cookie = (
+                browser_data / "cdp_account-2_dy_user_data_dir"
+                / "Default" / "Network" / "Cookies"
+            )
+            backup_cookie.parent.mkdir(parents=True)
+            backup_cookie.write_bytes(
+                b"b" * (PIPELINE.VALID_LOGIN_MIN_BYTES + 1)
+            )
+            works_file = root / "works.json"
+            works_file.write_text(
+                json.dumps({"works": []}), encoding="utf-8",
+            )
+            creator = {
+                "key": "creator-a",
+                "creator_url": "creator-a",
+                "works_file": str(works_file),
+                "media_output_dir": str(root / "output"),
+            }
             config = {
+                "python": "python",
+                "state_dir": str(root / "state"),
                 "collection": {
                     "account_profiles": ["account-1", "account-2"],
                     "per_creator_profile_pool": True,
                     "media_crawler_dir": str(media_crawler_dir),
                 },
+                "creators": [creator],
             }
-            creators = [{"key": "creator-a"}]
+            creators = [creator]
             logger = PIPELINE.Logger(root / "sync.log", persist=False)
 
             with PIPELINE.browser_profile_file_lock(browser_data, "account-1"):
@@ -1220,8 +1241,36 @@ class PipelineHelpersTest(unittest.TestCase):
 
             self.assertEqual(result["busy_profiles"], ["account-1"])
             self.assertEqual(
-                config["_runtime_stale_primary_replicas"], {"creator-a"},
+                config["_runtime_stale_primary_replicas"],
+                {"creator-a", "account-1"},
             )
+            args = argparse.Namespace(
+                skip_collect=False,
+                normalize_only=False,
+                force_full_collect=False,
+                skip_feishu_sync=True,
+                fail_fast=False,
+                dry_run=False,
+                max_works=None,
+                aweme_id=[],
+                backfill_existing=False,
+            )
+            attempted_profiles = []
+
+            def record_profile(_label, command, _env, **_kwargs):
+                attempted_profiles.append(
+                    command[command.index("--browser-profile-key") + 1]
+                )
+                return ""
+
+            runner = Mock()
+            runner.run.side_effect = record_profile
+            context = PIPELINE.collect_creator_phase(
+                config, creator, runner, logger, {}, args,
+            )
+
+            self.assertEqual(attempted_profiles, ["account-2"])
+            self.assertTrue(context["collection_ok"])
 
     def test_profile_refresh_rolls_back_all_state_when_one_path_fails(self):
         with tempfile.TemporaryDirectory() as directory:

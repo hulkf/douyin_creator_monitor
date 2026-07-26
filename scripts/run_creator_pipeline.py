@@ -868,6 +868,7 @@ def refresh_primary_profile_replicas(
         except ProfileBusyError:
             result["busy_profiles"].append(source_key)
             stale_replicas.update(target_keys)
+            stale_replicas.add(source_key)
             logger.write(
                 f"主账号槽位 {source_key} 正在使用；本轮停用对应达人并发 Profile，"
                 "将按页面顺序尝试备用账号。"
