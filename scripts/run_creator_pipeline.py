@@ -674,7 +674,9 @@ def sync_command(config: dict[str, Any], creator: dict[str, Any], works_file: Pa
     if not table:
         raise PipelineError(f"达人 {creator_key(creator)} 缺少 works_table_id。")
     command = py(config, "sync_douyin_works_to_feishu.py", "--works-file", works_file, "--table-id", table)
-    append_option(command, "--lark-cli", section(config, "feishu").get("lark_cli"))
+    feishu = section(config, "feishu")
+    append_option(command, "--lark-cli", feishu.get("lark_cli"))
+    append_option(command, "--as", feishu.get("as_identity"))
     return command
 
 

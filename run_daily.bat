@@ -21,6 +21,14 @@ set PIPELINE=D:\JR_project\douyin_creator_monitor\scripts\run_creator_pipeline.p
 REM Keep redirected Python output UTF-8 for every stage, including reconcile.
 set PYTHONIOENCODING=utf-8
 
+REM ---- Isolate this project from unrelated Agent lark-cli workspaces. ----
+REM HERMES_HOME/OPENCLAW_HOME/LARK_CHANNEL make lark-cli auto-select that
+REM Agent's app. Clear them and pin the ordinary local lark-cli config root.
+set "HERMES_HOME="
+set "OPENCLAW_HOME="
+set "LARK_CHANNEL="
+set "LARKSUITE_CLI_CONFIG_DIR=%USERPROFILE%\.lark-cli"
+
 REM ---- parse args without goto/labels (labels fail in some hosts) ----
 REM  RAW always starts with a sentinel space. Without it, cmd expands the
 REM  substitution on an empty %* to the literal "--no-pause=". The same
@@ -38,11 +46,24 @@ REM Relative redirection can fail before Python starts and hide all output.
 set BATLOG=%~dp0logs\bat-%TS%.log
 set NCCLOG=%~dp0logs\new-creator-check-%TS%.log
 set RECONLOG=%~dp0logs\reconcile-%TS%.log
+set FEISHUCHECKLOG=%~dp0logs\feishu-identity-%TS%.log
 
 echo === Starting pipeline ===
 echo Time: %date% %time%
 echo Command: "%PYTHON_EXE%" "%PIPELINE%"%PYARGS%
 echo.
+
+REM ---- Fail closed before any Feishu read/write when app identity drifted. ----
+"%PYTHON_EXE%" "D:\JR_project\douyin_creator_monitor\scripts\verify_feishu_cli_identity.py" --config "D:\JR_project\douyin_creator_monitor\local\pipeline.json" > "%FEISHUCHECKLOG%" 2>&1
+set FEISHU_PREFLIGHT_EL=%errorlevel%
+type "%FEISHUCHECKLOG%"
+echo.
+if not "%FEISHU_PREFLIGHT_EL%"=="0" (
+  echo [FAILED] Feishu identity preflight rejected the active lark-cli app.
+  echo Log file: %FEISHUCHECKLOG%
+  if "%NOPAUSE%"=="0" pause
+  exit /b %FEISHU_PREFLIGHT_EL%
+)
 
 REM ---- Reconcile the creator base table before collection. ----
 REM Recreate missing creator rows or work tables and repair stale pointers.

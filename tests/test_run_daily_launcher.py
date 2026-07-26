@@ -47,6 +47,17 @@ class RunDailyLauncherTest(unittest.TestCase):
         _, forwarded = self.parse_args("--no-pause", "--creator", "zhiliao")
         self.assertEqual(forwarded, " --creator zhiliao")
 
+    def test_feishu_agent_environment_is_cleared_before_identity_preflight(self):
+        source = RUN_DAILY.read_text(encoding="ascii")
+
+        preflight = source.index("verify_feishu_cli_identity.py")
+        reconcile = source.index("check_and_onboard_new_creators.py")
+        self.assertLess(source.index('set "HERMES_HOME="'), preflight)
+        self.assertLess(source.index('set "OPENCLAW_HOME="'), preflight)
+        self.assertLess(source.index('set "LARK_CHANNEL="'), preflight)
+        self.assertLess(preflight, reconcile)
+        self.assertIn("exit /b %FEISHU_PREFLIGHT_EL%", source)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -12,10 +12,15 @@ import sys
 from pathlib import Path
 from typing import Any
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from verify_feishu_cli_identity import isolated_lark_env, scoped_lark_command
+
 # 字段归属/规则校验（单一权威来源：scripts/creator_table_fields.py）。
 # 模块缺失时降级为无操作，绝不阻断主流程。
 try:
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
     from creator_table_fields import validate_backup_patch
 except Exception:  # noqa: BLE001
     def validate_backup_patch(patch):
@@ -48,11 +53,9 @@ def load_base_token(explicit: str | None) -> str:
 
 
 def run_lark(cli: str, args: list[str]) -> dict[str, Any]:
-    env = os.environ.copy()
-    env.setdefault("LARKSUITE_CLI_NO_UPDATE_NOTIFIER", "1")
-    env.setdefault("LARKSUITE_CLI_NO_SKILLS_NOTIFIER", "1")
     result = subprocess.run(
-        [cli, *args], cwd=PROJECT_DIR, env=env, capture_output=True,
+        scoped_lark_command(cli, args), cwd=PROJECT_DIR,
+        env=isolated_lark_env(), capture_output=True,
         text=True, encoding="utf-8", errors="replace", check=False,
     )
     output = result.stdout if result.returncode == 0 else result.stderr or result.stdout

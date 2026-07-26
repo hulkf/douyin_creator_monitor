@@ -1212,6 +1212,16 @@ class PipelineHelpersTest(unittest.TestCase):
         self.assertIn("--sync-profiles", command)
         self.assertEqual(command[command.index("--creator") + 1], "demo")
 
+    def test_work_sync_command_uses_configured_feishu_identity(self):
+        config = {
+            "python": "python",
+            "feishu": {"lark_cli": "lark-cli", "as_identity": "bot"},
+        }
+
+        command = PIPELINE.sync_command(config, {"key": "demo", "works_table_id": "tbl"}, Path("works.json"))
+
+        self.assertEqual(command[command.index("--as") + 1], "bot")
+
     def test_creator_collection_syncs_current_profile_before_no_new_works_exit(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

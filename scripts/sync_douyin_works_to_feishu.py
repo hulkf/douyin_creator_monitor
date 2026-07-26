@@ -19,7 +19,12 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
 from work_table_schema import CANONICAL_WORK_FIELDS, CANONICAL_WORK_FIELD_NAMES
+from verify_feishu_cli_identity import isolated_lark_env, scoped_lark_command
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -39,17 +44,14 @@ MAX_BATCH_CREATE_JSON_CHARS = 20_000
 
 
 def run_lark(cli: str, args: list[str]) -> dict[str, Any]:
-    env = os.environ.copy()
-    env.setdefault("LARKSUITE_CLI_NO_UPDATE_NOTIFIER", "1")
-    env.setdefault("LARKSUITE_CLI_NO_SKILLS_NOTIFIER", "1")
     result = subprocess.run(
-        [cli, *args],
+        scoped_lark_command(cli, args),
         cwd=PROJECT_DIR,
         text=True,
         encoding="utf-8",
         errors="replace",
         capture_output=True,
-        env=env,
+        env=isolated_lark_env(),
     )
     output = result.stdout if result.returncode == 0 else result.stderr or result.stdout
     try:
@@ -104,7 +106,9 @@ def build_patch(work: dict[str, Any], captured_at: str) -> dict[str, Any]:
     return {key: value for key, value in patch.items() if value is not None}
 
 
-def load_existing_records(cli: str, base_token: str, table_id: str) -> dict[str, dict[str, Any]]:
+def load_existing_records(
+    cli: str, base_token: str, table_id: str, as_identity: str = "user",
+) -> dict[str, dict[str, Any]]:
     existing: dict[str, dict[str, Any]] = {}
     offset = 0
     page_size = 200
@@ -118,7 +122,7 @@ def load_existing_records(cli: str, base_token: str, table_id: str) -> dict[str,
             command.extend(["--field-id", field_name])
         command.extend([
             "--offset", str(offset), "--limit", str(page_size),
-            "--format", "json", "--as", "user",
+            "--format", "json", "--as", as_identity,
         ])
         payload = run_lark(cli, command)
         data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
@@ -242,12 +246,14 @@ def schema_mismatches(live_fields: list[dict[str, Any]]) -> list[str]:
     return problems
 
 
-def validate_live_schema(cli: str, base_token: str, table_id: str) -> None:
+def validate_live_schema(
+    cli: str, base_token: str, table_id: str, as_identity: str = "user",
+) -> None:
     payload = run_lark(
         cli,
         [
             "base", "+field-list", "--base-token", base_token,
-            "--table-id", table_id, "--format", "json", "--as", "user",
+            "--table-id", table_id, "--format", "json", "--as", as_identity,
         ],
     )
     data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
@@ -333,6 +339,7 @@ def structured_record_fields(value: Any) -> dict[str, dict[str, Any]]:
 def verify_written_records(
     cli: str, base_token: str, table_id: str,
     record_ids: dict[str, str], expected_fields: dict[str, dict[str, Any]],
+    as_identity: str = "user",
 ) -> int:
     """Read newly written rows back and fail if any core field is absent or changed."""
     verified = 0
@@ -347,7 +354,7 @@ def verify_written_records(
             command.extend(["--record-id", record_id])
         for field_name in CORE_VERIFY_FIELDS:
             command.extend(["--field-id", field_name])
-        command.extend(["--format", "json", "--as", "user"])
+        command.extend(["--format", "json", "--as", as_identity])
         payload = run_lark(cli, command)
         structured = structured_record_fields(payload)
         data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
@@ -386,6 +393,7 @@ def sync(args: argparse.Namespace) -> dict[str, Any]:
     base_token = args.base_token or os.environ.get("FEISHU_BASE_TOKEN")
     if not base_token:
         raise SystemExit("Missing --base-token or FEISHU_BASE_TOKEN.")
+    as_identity = str(getattr(args, "as_identity", "user") or "user")
     works_payload = json.loads(Path(args.works_file).read_text(encoding="utf-8"))
     works = works_payload.get("works") or []
     if not works:
@@ -405,8 +413,8 @@ def sync(args: argparse.Namespace) -> dict[str, Any]:
 
     captured_at = beijing_time(datetime.now(tz=timezone.utc).timestamp()) or ""
     if not args.skip_schema_validation:
-        validate_live_schema(args.lark_cli, base_token, args.table_id)
-    existing = load_existing_records(args.lark_cli, base_token, args.table_id)
+        validate_live_schema(args.lark_cli, base_token, args.table_id, as_identity)
+    existing = load_existing_records(args.lark_cli, base_token, args.table_id, as_identity)
     existing_before = len(existing)
     plan = plan_sync(works, existing, captured_at)
     updated = len(plan["update"])
@@ -429,7 +437,7 @@ def sync(args: argparse.Namespace) -> dict[str, Any]:
                     "base", "+record-batch-create", "--base-token", base_token,
                     "--table-id", args.table_id,
                     "--json", batch_json,
-                    "--format", "json", "--as", "user",
+                    "--format", "json", "--as", as_identity,
                 ],
             )
             created_ids = extract_record_ids(response)
@@ -455,7 +463,7 @@ def sync(args: argparse.Namespace) -> dict[str, Any]:
             "--json",
             json.dumps(patch_value, ensure_ascii=False),
             "--as",
-            "user",
+            as_identity,
             "--record-id",
             record_id,
         ]
@@ -482,7 +490,7 @@ def sync(args: argparse.Namespace) -> dict[str, Any]:
                         "record_id_list": batch_ids,
                         "patch": {"最近采集时间": captured_at},
                     }, ensure_ascii=False),
-                    "--format", "json", "--as", "user",
+                    "--format", "json", "--as", as_identity,
                 ],
             )
             recent_collection_refreshed += len(batch_ids)
@@ -498,7 +506,9 @@ def sync(args: argparse.Namespace) -> dict[str, Any]:
             item["work_id"]: {name: item["patch"].get(name) for name in CORE_VERIFY_FIELDS}
             for item in written
         }
-        verified = verify_written_records(args.lark_cli, base_token, args.table_id, written_ids, expected)
+        verified = verify_written_records(
+            args.lark_cli, base_token, args.table_id, written_ids, expected, as_identity,
+        )
 
     return {
         "input_count": len(works),
@@ -520,6 +530,7 @@ def main() -> int:
     parser.add_argument("--base-token")
     parser.add_argument("--table-id", required=True)
     parser.add_argument("--lark-cli", default=str(DEFAULT_LARK_CLI))
+    parser.add_argument("--as", dest="as_identity", default="user", choices=["user", "bot"])
     parser.add_argument("--skip-schema-validation", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()

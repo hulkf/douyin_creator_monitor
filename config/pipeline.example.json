@@ -27,6 +27,9 @@
     "creator_table_id": "REPLACE_WITH_FEISHU_CREATOR_TABLE_ID",
     "ids_file": "local/feishu-ids.md",
     "lark_cli": "tools/lark-cli/lark-cli.exe",
+    "profile": "REPLACE_WITH_PROJECT_LARK_PROFILE",
+    "expected_app_id": "REPLACE_WITH_PROJECT_FEISHU_APP_ID",
+    "expected_app_name": "REPLACE_WITH_PROJECT_FEISHU_APP_NAME",
     "work_id_field": "抖音作品ID",
     "transcript_field": "语音转写全文",
     "as_identity": "user"

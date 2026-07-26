@@ -8,8 +8,15 @@ import json
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from verify_feishu_cli_identity import isolated_lark_env, scoped_lark_command
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -51,13 +58,14 @@ def read_text_arg(value: str | None, file_value: str | None) -> str:
 
 def run_lark(cli: str, args: list[str], input_text: str | None = None) -> dict:
     result = subprocess.run(
-        [cli, *args],
+        scoped_lark_command(cli, args),
         check=False,
         capture_output=True,
         text=True,
         encoding="utf-8",
         errors="replace",
         input=input_text,
+        env=isolated_lark_env(),
     )
     if result.returncode != 0:
         raise SystemExit(result.stderr.strip() or result.stdout.strip() or f"lark-cli exited {result.returncode}")
