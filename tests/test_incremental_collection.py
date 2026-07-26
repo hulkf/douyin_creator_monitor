@@ -52,13 +52,21 @@ class IncrementalCollectionTest(unittest.TestCase):
                 COLLECTOR.subprocess,
                 "run",
                 return_value=SimpleNamespace(returncode=0),
-            ), patch.object(COLLECTOR, "cleanup_mediacrawler_chrome"):
+            ) as run_external, patch.object(
+                COLLECTOR, "cleanup_mediacrawler_chrome",
+            ), patch.object(
+                COLLECTOR, "find_unrelated_user_chrome_pids", return_value={24380},
+            ):
                 output_dir, _ = COLLECTOR.run_mediacrawler(args, mode="incremental", known_ids=set())
 
             bootstrap = (output_dir / "_run_mediacrawler_douyin_creator.py").read_text(encoding="utf-8")
             self.assertIn("--window-size={window_width},{window_height}", bootstrap)
             self.assertIn("window_width = 420", bootstrap)
             self.assertIn("window_height = 280", bootstrap)
+            self.assertEqual(
+                run_external.call_args.kwargs["env"][COLLECTOR.UNRELATED_CHROME_PIDS_ENV],
+                "24380",
+            )
 
     def test_known_first_work_still_probes_three_then_stops(self):
         selected, checked, stopped, boundary = COLLECTOR.select_incremental_page(
@@ -397,7 +405,8 @@ class IncrementalCollectionTest(unittest.TestCase):
             self.assertTrue(all("config.CDP_HEADLESS = requested_headless and not interactive_login" in text for text in bootstrap_texts))
             self.assertTrue(all("'--headless', 'true' if requested_headless and not interactive_login else 'false'" in text for text in bootstrap_texts))
             self.assertTrue(all("--no-startup-window" in text for text in bootstrap_texts))
-            self.assertTrue(all("_close_new_blank_chrome_windows" not in text for text in bootstrap_texts))
+            self.assertTrue(all("close_new_blank_chrome_windows" in text for text in bootstrap_texts))
+            self.assertTrue(all("UNRELATED_CHROME_PIDS_ENV" in text for text in bootstrap_texts))
             self.assertTrue(all("subprocess.CREATE_NO_WINDOW" in text for text in bootstrap_texts))
             self.assertTrue(all("INTERACTIVE_LOGIN_EXIT_CODE" in text for text in bootstrap_texts))
             self.assertTrue(all("kwargs.setdefault('wait_until', 'domcontentloaded')" in text for text in bootstrap_texts))
@@ -424,6 +433,59 @@ class IncrementalCollectionTest(unittest.TestCase):
             self.assertEqual(command[:3], [sys.executable, "-S", "-c"])
             self.assertEqual(command[-1], str(bootstrap))
             self.assertIn(repr(str(media / ".venv" / "Lib" / "site-packages")), command[3])
+
+    def test_blank_window_cleanup_only_closes_new_windows_in_existing_user_chrome(self):
+        closed = []
+
+        with patch.object(COLLECTOR.os, "name", "nt"):
+            result = COLLECTOR.close_new_blank_chrome_windows(
+                existing_handles={100},
+                allowed_pids={24380},
+                attempts=1,
+                list_windows=lambda _allowed: {
+                    100: 24380,  # Existing user blank window: preserve it.
+                    200: 24380,  # New singleton-handoff blank window: close it.
+                    300: 99999,  # New project-profile window: preserve it.
+                },
+                close_window=closed.append,
+                sleep=lambda _seconds: None,
+            )
+
+        self.assertEqual(result, {200})
+        self.assertEqual(closed, [200])
+
+    def test_user_chrome_pid_discovery_excludes_project_cdp_roots_and_children(self):
+        class FakeProcess:
+            def __init__(self, pid, command_line):
+                self.pid = pid
+                self.info = {
+                    "pid": pid,
+                    "name": "chrome.exe",
+                    "cmdline": command_line,
+                }
+
+        user_root = FakeProcess(10, ["chrome.exe"])
+        project_root = FakeProcess(
+            20,
+            [
+                "chrome.exe",
+                "--remote-debugging-port=9222",
+                "--user-data-dir=D:/MediaCrawler/browser_data/cdp_account-1_dy_user_data_dir",
+            ],
+        )
+        user_renderer = FakeProcess(30, ["chrome.exe", "--type=renderer"])
+        fake_psutil = SimpleNamespace(
+            NoSuchProcess=RuntimeError,
+            AccessDenied=PermissionError,
+            process_iter=lambda _attrs: [user_root, project_root, user_renderer],
+        )
+
+        with patch.object(COLLECTOR.os, "name", "nt"), patch.dict(
+            sys.modules, {"psutil": fake_psutil},
+        ):
+            result = COLLECTOR.find_unrelated_user_chrome_pids()
+
+        self.assertEqual(result, {10})
 
     def test_mediacrawler_failure_still_closes_its_isolated_chrome(self):
         with tempfile.TemporaryDirectory() as directory:

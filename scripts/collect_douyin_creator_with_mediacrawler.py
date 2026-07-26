@@ -24,6 +24,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Iterable
@@ -37,6 +38,7 @@ BEIJING_TZ = timezone(timedelta(hours=8))
 COLLECTION_STATE_VERSION = 1
 INTERACTIVE_LOGIN_EXIT_CODE = 86
 INTERACTIVE_LOGIN_ENV = "DOUYIN_INTERACTIVE_LOGIN"
+UNRELATED_CHROME_PIDS_ENV = "DOUYIN_UNRELATED_CHROME_PIDS"
 # Fields that must come from this run's user-profile response. Other required
 # Feishu fields are generated here (URL/status/check time) or derived from works
 # later (last post time).
@@ -218,6 +220,120 @@ def cleanup_mediacrawler_chrome(browser_profile_key: str, cdp_port: int) -> list
             f"[collector] closed {len(closed)} Chrome processes "
             f"for profile={browser_profile_key} cdp_port={cdp_port}"
         )
+    return closed
+
+
+def find_unrelated_user_chrome_pids() -> set[int]:
+    """Return pre-existing user Chrome roots, excluding project/CDP browsers."""
+
+    if os.name != "nt":
+        return set()
+    try:
+        import psutil
+    except ImportError:
+        print(
+            "[collector] warning: psutil unavailable; startup blank-window cleanup skipped",
+            file=sys.stderr,
+        )
+        return set()
+
+    result: set[int] = set()
+    for process in psutil.process_iter(["pid", "name", "cmdline"]):
+        try:
+            if str(process.info.get("name") or "").lower() != "chrome.exe":
+                continue
+            command_line = " ".join(process.info.get("cmdline") or []).lower()
+            if "--type=" in command_line:
+                continue
+            if "_dy_user_data_dir" in command_line or "--remote-debugging-port=" in command_line:
+                continue
+            result.add(int(process.info["pid"]))
+        except (KeyError, TypeError, ValueError, psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return result
+
+
+def visible_blank_chrome_windows(allowed_pids: set[int]) -> dict[int, int]:
+    """Map visible blank Chrome window handles to allowed existing process IDs."""
+
+    if os.name != "nt" or not allowed_pids:
+        return {}
+
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    callback_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    windows: dict[int, int] = {}
+    blank_titles = {"新标签页 - Google Chrome", "New Tab - Google Chrome"}
+
+    def visit(hwnd, _lparam):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        process_id = ctypes.c_ulong()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
+        if int(process_id.value) not in allowed_pids:
+            return True
+        class_name = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, class_name, len(class_name))
+        if class_name.value != "Chrome_WidgetWin_1":
+            return True
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length <= 0:
+            return True
+        title = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, title, length + 1)
+        if title.value in blank_titles:
+            windows[int(hwnd)] = int(process_id.value)
+        return True
+
+    user32.EnumWindows(callback_type(visit), 0)
+    return windows
+
+
+def _close_chrome_window(hwnd: int) -> None:
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    user32.ShowWindow(hwnd, 0)
+    user32.PostMessageW(hwnd, 0x0010, 0, 0)  # WM_CLOSE
+
+
+def close_new_blank_chrome_windows(
+    existing_handles: set[int],
+    allowed_pids: set[int],
+    *,
+    attempts: int = 20,
+    list_windows=None,
+    close_window=None,
+    sleep=None,
+) -> set[int]:
+    """Close only new singleton-handoff blanks in pre-existing user Chrome.
+
+    The project browser starts in a new PID and is therefore never eligible.
+    Blank windows that existed before this launch are also preserved.
+    """
+
+    if os.name != "nt" or not allowed_pids:
+        return set()
+    list_windows = list_windows or visible_blank_chrome_windows
+    close_window = close_window or _close_chrome_window
+    sleep = sleep or time.sleep
+    closed: set[int] = set()
+    for attempt in range(max(1, attempts)):
+        current = list_windows(allowed_pids)
+        for hwnd, process_id in current.items():
+            if (
+                hwnd in existing_handles
+                or hwnd in closed
+                or process_id not in allowed_pids
+            ):
+                continue
+            close_window(hwnd)
+            closed.add(hwnd)
+        if attempt + 1 < max(1, attempts):
+            sleep(0.1)
+    if closed:
+        print(f"[collector] closed {len(closed)} startup blank Chrome window(s)")
     return closed
 
 
@@ -849,16 +965,21 @@ def run_mediacrawler(
                 "from pathlib import Path",
                 "import asyncio, json, os, runpy, subprocess, sys",
                 f"INTERACTIVE_LOGIN_EXIT_CODE = {INTERACTIVE_LOGIN_EXIT_CODE}",
+                f"UNRELATED_CHROME_PIDS_ENV = {UNRELATED_CHROME_PIDS_ENV!r}",
                 f"interactive_login = os.environ.get({INTERACTIVE_LOGIN_ENV!r}) == '1'",
                 f"requested_headless = {bool(getattr(args, 'headless', True))!r}",
                 f"window_width = {int(getattr(args, 'browser_window_width', 480))!r}",
                 f"window_height = {int(getattr(args, 'browser_window_height', 360))!r}",
                 f"login_only = {bool(getattr(args, 'login_only', False))!r}",
                 "visible_browser = (not requested_headless) or interactive_login",
+                f"sys.path.insert(0, {str(PROJECT_DIR / 'scripts')!r})",
+                "from collect_douyin_creator_with_mediacrawler import close_new_blank_chrome_windows, visible_blank_chrome_windows",
+                "unrelated_chrome_pids = {int(value) for value in os.environ.get(UNRELATED_CHROME_PIDS_ENV, '').split(',') if value.isdigit()}",
                 "_original_popen = subprocess.Popen",
                 "def _popen_without_startup_window(command, *args, **kwargs):",
                 "    if isinstance(command, (list, tuple)) and any(str(part).startswith('--remote-debugging-port=') for part in command):",
                 "        command = list(command)",
+                "        existing_blank_windows = set(visible_blank_chrome_windows(unrelated_chrome_pids))",
                 "        if visible_browser and not any(str(part).startswith('--window-size=') for part in command):",
                 "            command.append(f'--window-size={window_width},{window_height}')",
                 "        if requested_headless and not interactive_login and '--no-startup-window' not in command:",
@@ -871,6 +992,7 @@ def run_mediacrawler(
                 "            kwargs['startupinfo'] = startupinfo",
                 "        print('[collector] chrome launch flags headless=' + str('--headless=new' in command).lower() + ' no_startup=' + str('--no-startup-window' in command).lower())",
                 "        process = _original_popen(command, *args, **kwargs)",
+                "        close_new_blank_chrome_windows(existing_blank_windows, unrelated_chrome_pids)",
                 "        return process",
                 "    return _original_popen(command, *args, **kwargs)",
                 "subprocess.Popen = _popen_without_startup_window",
@@ -1061,6 +1183,9 @@ def run_mediacrawler(
     command = build_mediacrawler_command(media_dir, args.media_crawler_python, bootstrap)
     run_env = os.environ.copy()
     run_env.pop(INTERACTIVE_LOGIN_ENV, None)
+    run_env[UNRELATED_CHROME_PIDS_ENV] = ",".join(
+        str(pid) for pid in sorted(find_unrelated_user_chrome_pids())
+    )
     # --login-only means the user explicitly wants to log in right now.
     # Skip the headless probe (which wastes minutes starting Chrome, navigating
     # to Douyin, detecting "not logged in", exiting, cleaning up, then restarting)
