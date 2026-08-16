@@ -519,6 +519,7 @@ class WebDashboardStaticTests(unittest.TestCase):
         project_dir = Path(__file__).resolve().parents[1]
         html = (project_dir / "web" / "index.html").read_text(encoding="utf-8")
         javascript = (project_dir / "web" / "app.js").read_text(encoding="utf-8")
+        stylesheet = (project_dir / "web" / "styles.css").read_text(encoding="utf-8")
 
         self.assertLess(
             html.index('id="permission-check-panel"'),
@@ -528,6 +529,11 @@ class WebDashboardStaticTests(unittest.TestCase):
         self.assertIn('id="permission-check-list"', html)
         self.assertIn('api("/api/permissions")', javascript)
         self.assertIn("startPermissionLogin", javascript)
+        self.assertIn(".permission-check-list { display: flex;", stylesheet)
+        self.assertIn("flex-wrap: nowrap", stylesheet)
+        self.assertIn("overflow-x: auto", stylesheet)
+        self.assertIn(".permission-check-item { flex:", stylesheet)
+        self.assertNotIn(".permission-check-list { grid-template-columns: 1fr; }", stylesheet)
         self.assertLess(
             javascript.index('const permissions = await api("/api/permissions")'),
             javascript.index('const payload = await api("/api/run"'),
