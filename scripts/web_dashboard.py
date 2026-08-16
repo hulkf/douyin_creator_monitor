@@ -696,6 +696,207 @@ def account_pool_payload(project_dir: Path = PROJECT_DIR) -> dict[str, Any]:
     return {"profiles": profiles, "configured_count": len(profiles)}
 
 
+def _read_local_env_keys(path: Path) -> set[str]:
+    try:
+        lines = path.read_text(encoding="utf-8-sig").splitlines()
+    except OSError:
+        return set()
+    keys: set[str] = set()
+    for line in lines:
+        match = re.match(r"\s*(?:\$env:)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$", line)
+        value = match.group(2).strip().strip('"\'') if match else ""
+        if match and value and not line.lstrip().startswith("#"):
+            keys.add(match.group(1))
+    return keys
+
+
+def _available_secret_keys(project_dir: Path, *json_names: str) -> set[str]:
+    keys = {key for key, value in os.environ.items() if str(value or "").strip()}
+    keys.update(_read_local_env_keys(project_dir / "local" / ".env"))
+    for name in json_names:
+        try:
+            payload = json.loads((project_dir / "local" / name).read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(payload, dict):
+            keys.update(key for key, value in payload.items() if str(value or "").strip())
+    return keys
+
+
+def _configured_path(project_dir: Path, value: Any, fallback: str) -> Path:
+    return GUI.project_path(project_dir, value, project_dir / fallback)
+
+
+def _permission_check(
+    check_id: str,
+    label: str,
+    ready: bool,
+    success_detail: str,
+    failure_detail: str,
+    *,
+    action: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "id": check_id,
+        "label": label,
+        "status": "ready" if ready else "failed",
+        "detail": success_detail if ready else failure_detail,
+    }
+    if action:
+        result["action"] = action
+    return result
+
+
+def permission_checks_payload(project_dir: Path = PROJECT_DIR) -> dict[str, Any]:
+    """Return fast, read-only startup checks for every enabled account dependency.
+
+    These checks deliberately describe local credential/session readiness. They do
+    not write remote data and do not claim an online permission probe succeeded.
+    """
+
+    project_dir = project_dir.resolve()
+    config = load_pipeline_config(project_dir).config
+    checks: list[dict[str, Any]] = []
+
+    account_pool = account_pool_payload(project_dir)
+    profiles = account_pool.get("profiles") if isinstance(account_pool, dict) else []
+    profiles = profiles if isinstance(profiles, list) else []
+    if profiles:
+        for profile in profiles:
+            key = str(profile.get("key") or "")
+            status = str(profile.get("status") or "missing")
+            check = _permission_check(
+                f"douyin:{key}",
+                f"抖音采集账号 · {key}",
+                status == "ready",
+                "已检测到本地登录态；正式采集时仍会校验是否失效或风控。",
+                "未检测到有效本地登录态，请重新扫码登录。",
+                action={"type": "douyin_login", "profile_key": key, "label": "重新登录"},
+            )
+            if status == "running":
+                check["status"] = "running"
+                check["detail"] = "登录窗口已打开，正在等待扫码完成。"
+            checks.append(check)
+    else:
+        checks.append(_permission_check(
+            "douyin",
+            "抖音采集账号",
+            False,
+            "账号池已配置。",
+            "尚未配置任何抖音账号槽位。",
+            action={"type": "config", "category": "accounts", "label": "配置账号"},
+        ))
+
+    feishu = config.get("feishu") if isinstance(config.get("feishu"), dict) else {}
+    feishu_keys = _available_secret_keys(project_dir)
+    token_env = str(feishu.get("base_token_env") or "FEISHU_BASE_TOKEN")
+    ids_file = _configured_path(project_dir, feishu.get("ids_file"), "local/feishu-ids.md")
+    try:
+        ids_text = ids_file.read_text(encoding="utf-8-sig")
+    except OSError:
+        ids_text = ""
+    local_token_match = re.search(r"(?im)^\s*[-*]?\s*base[_ ]token\s*[:=]\s*(\S+)", ids_text)
+    local_token = local_token_match.group(1).strip() if local_token_match else ""
+    has_base_token = token_env in feishu_keys or bool(
+        local_token and not local_token.startswith("REPLACE_WITH_")
+    )
+    lark_cli = _configured_path(project_dir, feishu.get("lark_cli"), "tools/lark-cli/lark-cli.exe")
+    profile = str(feishu.get("profile") or "").strip()
+    creator_table_id = str(feishu.get("creator_table_id") or "").strip()
+    feishu_ready = bool(
+        lark_cli.is_file()
+        and has_base_token
+        and profile
+        and not profile.startswith("REPLACE_WITH_")
+        and creator_table_id
+        and not creator_table_id.startswith("REPLACE_WITH_")
+    )
+    checks.append(_permission_check(
+        "feishu",
+        "飞书数据账号",
+        feishu_ready,
+        "CLI、Base 标识和身份配置已就绪；此处未执行远端写入。",
+        "飞书 CLI、Base 标识或身份配置不完整。",
+        action={"type": "config", "category": "feishu", "label": "检查配置"},
+    ))
+
+    asr = config.get("asr") if isinstance(config.get("asr"), dict) else {}
+    provider = str(asr.get("provider") or "volcengine").strip().casefold()
+    if provider == "volcengine":
+        asr_keys = _available_secret_keys(project_dir, "volcengine.env.json")
+        asr_ready = "VOLC_ASR_API_KEY" in asr_keys or {
+            "VOLC_ASR_APP_ID", "VOLC_ASR_ACCESS_TOKEN", "VOLC_ASR_CLUSTER",
+        }.issubset(asr_keys)
+        asr_label = "火山引擎 ASR 账号"
+        asr_id = "volcengine_asr"
+    else:
+        asr_keys = _available_secret_keys(project_dir, "bailian.env.json")
+        asr_ready = bool({"DASHSCOPE_API_KEY", "BAILIAN_API_KEY"} & asr_keys)
+        asr_label = f"{provider or 'ASR'} 转写账号"
+        asr_id = "asr"
+    checks.append(_permission_check(
+        asr_id,
+        asr_label,
+        asr_ready,
+        "本地转写凭据已配置；实际额度和接口权限将在调用时确认。",
+        "缺少当前转写服务所需的本地凭据。",
+        action={"type": "config", "category": "asr", "label": "更新凭据"},
+    ))
+
+    summary = config.get("summary") if isinstance(config.get("summary"), dict) else {}
+    if bool(summary.get("enabled", True)):
+        summary_key = str(summary.get("api_key_env") or "OPENAI_API_KEY").strip()
+        summary_keys = _available_secret_keys(project_dir)
+        summary_ready = bool(str(summary.get("model") or "").strip() and summary_key in summary_keys)
+        checks.append(_permission_check(
+            "summary",
+            "内容总结模型账号",
+            summary_ready,
+            "模型和本地 API Key 已配置；实际额度将在调用时确认。",
+            "缺少总结模型名称或对应的本地 API Key。",
+            action={"type": "config", "category": "summary", "label": "更新凭据"},
+        ))
+
+    ima = config.get("ima") if isinstance(config.get("ima"), dict) else {}
+    if bool(ima.get("enabled", True)):
+        ima_keys = _available_secret_keys(project_dir, "ima.env.json")
+        ima_ready = {"IMA_OPENAPI_CLIENTID", "IMA_OPENAPI_APIKEY"}.issubset(ima_keys) or {
+            "client_id", "api_key",
+        }.issubset(ima_keys)
+        checks.append(_permission_check(
+            "ima", "IMA 知识库账号", ima_ready,
+            "本地 OpenAPI 凭据已配置；在线权限和当日额度将在调用时确认。",
+            "缺少 IMA Client ID 或 API Key。",
+            action={"type": "config", "category": "backups", "label": "更新凭据"},
+        ))
+
+    kuake = config.get("kuake") if isinstance(config.get("kuake"), dict) else {}
+    if bool(kuake.get("enabled", True)):
+        kuake_env_path = _configured_path(project_dir, kuake.get("local_env"), "local/kuake.env.json")
+        kuake_keys = _available_secret_keys(project_dir, kuake_env_path.name)
+        has_kuake_credential = bool({"KUAKE_COOKIE", "kuake_cookie"} & kuake_keys) or {
+            "KUAKE_PUS", "KUAKE_PUUS",
+        }.issubset(kuake_keys) or {"kuake_pus", "kuake_puus"}.issubset(kuake_keys)
+        kuake_exe = _configured_path(project_dir, kuake.get("kuake_exe"), "tools/kuake-cli/kuake.exe")
+        checks.append(_permission_check(
+            "kuake", "夸克网盘账号", has_kuake_credential and kuake_exe.is_file(),
+            "夸克 CLI 和本地 Cookie 凭据已配置；失效状态将在调用时确认。",
+            "缺少夸克 CLI 或 Cookie 凭据。",
+            action={"type": "config", "category": "backups", "label": "更新凭据"},
+        ))
+
+    passed = sum(1 for check in checks if check["status"] == "ready")
+    return {
+        "checks": checks,
+        "total": len(checks),
+        "checked": len(checks),
+        "passed": passed,
+        "all_passed": passed == len(checks),
+        "checked_at": datetime.now().astimezone().isoformat(),
+        "scope_note": "绿色仅表示本地登录态或凭据准备检查通过；远端权限、额度与风控仍由正式调用确认。扫码型账号可直接重登，密钥型账号请更新本地凭据。",
+    }
+
+
 def build_account_login_command(
     project_dir: Path,
     config: dict[str, Any],
@@ -867,6 +1068,7 @@ def make_handler(
     task_starter: Callable[[str], str] = GUI.start_scheduled_task,
     account_status_provider: Callable[[Path], dict[str, Any]] = account_pool_payload,
     account_login_starter: Callable[[str, Path], dict[str, Any]] = start_account_login,
+    permission_provider: Callable[[Path], dict[str, Any]] = permission_checks_payload,
     history_provider: Callable[[Path], dict[str, Any]] = run_history_payload,
     funnel_provider: Callable[[Path], dict[str, Any]] = work_funnel_payload,
 ) -> type[BaseHTTPRequestHandler]:
@@ -954,6 +1156,8 @@ def make_handler(
                     self._json(HTTPStatus.OK, snapshot_payload(snapshot_builder(project_dir)))
                 elif path == "/api/accounts":
                     self._json(HTTPStatus.OK, account_status_provider(project_dir))
+                elif path == "/api/permissions":
+                    self._json(HTTPStatus.OK, permission_provider(project_dir))
                 elif path == "/api/history":
                     self._json(HTTPStatus.OK, history_provider(project_dir))
                 elif path == "/api/funnel":

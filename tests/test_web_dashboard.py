@@ -147,6 +147,70 @@ class WebDashboardConfigTests(unittest.TestCase):
             self.assertEqual(payload["profiles"][0]["status"], "ready")
             self.assertEqual(payload["profiles"][1]["status"], "missing")
 
+    def test_permission_checks_cover_all_enabled_account_dependencies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "config").mkdir()
+            (root / "local").mkdir()
+            (root / "tools" / "lark-cli").mkdir(parents=True)
+            (root / "tools" / "kuake-cli").mkdir(parents=True)
+            (root / "tools" / "lark-cli" / "lark-cli.exe").write_bytes(b"cli")
+            (root / "tools" / "kuake-cli" / "kuake.exe").write_bytes(b"cli")
+            config = valid_config()
+            config.update({
+                "collection": {
+                    "account_profiles": ["account-a", "account-b"],
+                    "media_crawler_dir": "MediaCrawler",
+                },
+                "feishu": {
+                    "creator_table_id": "creator-table",
+                    "work_id_field": "抖音作品ID",
+                    "lark_cli": "tools/lark-cli/lark-cli.exe",
+                    "profile": "creator-monitor",
+                    "base_token_env": "FEISHU_BASE_TOKEN",
+                },
+                "asr": {"provider": "volcengine"},
+                "summary": {"enabled": True, "model": "glm", "api_key_env": "ZHIPU_API_KEY"},
+                "ima": {"enabled": True},
+                "kuake": {
+                    "enabled": True,
+                    "local_env": "local/kuake.env.json",
+                    "kuake_exe": "tools/kuake-cli/kuake.exe",
+                },
+            })
+            for path in (root / "config" / "pipeline.example.json", root / "local" / "pipeline.json"):
+                path.write_text(json.dumps(config), encoding="utf-8")
+            (root / "local" / "feishu-ids.md").write_text("Base token: bas_test", encoding="utf-8")
+            (root / "local" / "volcengine.env.json").write_text(
+                json.dumps({"VOLC_ASR_API_KEY": "secret"}), encoding="utf-8"
+            )
+            (root / "local" / ".env").write_text("ZHIPU_API_KEY=secret\n", encoding="utf-8")
+            (root / "local" / "ima.env.json").write_text(json.dumps({
+                "IMA_OPENAPI_CLIENTID": "client", "IMA_OPENAPI_APIKEY": "secret",
+            }), encoding="utf-8")
+            (root / "local" / "kuake.env.json").write_text(
+                json.dumps({"KUAKE_COOKIE": "cookie"}), encoding="utf-8"
+            )
+            cookie = (
+                root / "MediaCrawler" / "browser_data"
+                / "cdp_account-a_dy_user_data_dir" / "Default" / "Network" / "Cookies"
+            )
+            cookie.parent.mkdir(parents=True)
+            cookie.write_bytes(b"x" * (WEB.VALID_LOGIN_MIN_BYTES + 1))
+
+            payload = WEB.permission_checks_payload(root)
+
+            checks = {item["id"]: item for item in payload["checks"]}
+            self.assertEqual(checks["douyin:account-a"]["status"], "ready")
+            self.assertEqual(checks["douyin:account-b"]["status"], "failed")
+            self.assertEqual(checks["douyin:account-b"]["action"]["type"], "douyin_login")
+            for check_id in ("feishu", "volcengine_asr", "summary", "ima", "kuake"):
+                self.assertEqual(checks[check_id]["status"], "ready")
+            self.assertEqual(payload["total"], 7)
+            self.assertEqual(payload["checked"], 7)
+            self.assertEqual(payload["passed"], 6)
+            self.assertFalse(payload["all_passed"])
+
     def test_account_login_command_is_isolated_to_selected_profile(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -175,6 +239,28 @@ class WebDashboardConfigTests(unittest.TestCase):
             self.assertEqual(WEB.active_account_login_keys(), ["account-a"])
         finally:
             WEB._ACCOUNT_LOGIN_PROCESSES.clear()
+
+    def test_permission_check_keeps_login_in_progress_out_of_red_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "config").mkdir()
+            (root / "local").mkdir()
+            config = valid_config()
+            config["collection"] = {
+                "account_profiles": ["account-a"], "media_crawler_dir": "MediaCrawler",
+            }
+            for path in (root / "config" / "pipeline.example.json", root / "local" / "pipeline.json"):
+                path.write_text(json.dumps(config), encoding="utf-8")
+            process = Mock()
+            process.poll.return_value = None
+            WEB._ACCOUNT_LOGIN_PROCESSES["account-a"] = process
+            try:
+                payload = WEB.permission_checks_payload(root)
+            finally:
+                WEB._ACCOUNT_LOGIN_PROCESSES.clear()
+
+            douyin = next(item for item in payload["checks"] if item["id"] == "douyin:account-a")
+            self.assertEqual(douyin["status"], "running")
 
     def test_successful_main_login_immediately_refreshes_creator_replicas(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -429,6 +515,24 @@ class WebDashboardStaticTests(unittest.TestCase):
         self.assertIn('"账号槽位名称 · 主账号"', javascript)
         self.assertIn("`账号槽位名称 · 备用账号 ${index}`", javascript)
 
+    def test_current_task_starts_with_account_permission_progress(self):
+        project_dir = Path(__file__).resolve().parents[1]
+        html = (project_dir / "web" / "index.html").read_text(encoding="utf-8")
+        javascript = (project_dir / "web" / "app.js").read_text(encoding="utf-8")
+
+        self.assertLess(
+            html.index('id="permission-check-panel"'),
+            html.index('id="current-task-state"'),
+        )
+        self.assertIn('id="permission-progress-fill"', html)
+        self.assertIn('id="permission-check-list"', html)
+        self.assertIn('api("/api/permissions")', javascript)
+        self.assertIn("startPermissionLogin", javascript)
+        self.assertLess(
+            javascript.index('const permissions = await api("/api/permissions")'),
+            javascript.index('const payload = await api("/api/run"'),
+        )
+
 
 class WebDashboardBrowserLaunchTests(unittest.TestCase):
     def test_open_dashboard_closes_only_new_blank_windows_in_existing_user_chrome(self):
@@ -467,6 +571,9 @@ class WebDashboardHttpTests(unittest.TestCase):
         self.task_starter = Mock(return_value="started")
         self.account_status_provider = Mock(return_value={"profiles": []})
         self.account_login_starter = Mock(return_value={"message": "login started"})
+        self.permission_provider = Mock(return_value={
+            "checks": [], "total": 0, "checked": 0, "passed": 0, "all_passed": True,
+        })
         self.history_provider = Mock(return_value={"stats": {"total_runs": 0}, "runs": []})
         handler = WEB.make_handler(
             self.root,
@@ -474,6 +581,7 @@ class WebDashboardHttpTests(unittest.TestCase):
             task_starter=self.task_starter,
             account_status_provider=self.account_status_provider,
             account_login_starter=self.account_login_starter,
+            permission_provider=self.permission_provider,
             history_provider=self.history_provider,
         )
         self.server = WEB.ThreadingHTTPServer(("127.0.0.1", 0), handler)
@@ -532,6 +640,13 @@ class WebDashboardHttpTests(unittest.TestCase):
         self.assertEqual(status, 202)
         self.assertEqual(payload["message"], "login started")
         self.account_login_starter.assert_called_once_with("account-a", self.root)
+
+    def test_permission_api_returns_initial_account_checks(self):
+        status, payload = self.request("/api/permissions")
+
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["all_passed"])
+        self.permission_provider.assert_called_once_with(self.root)
 
     def test_history_api_returns_plain_language_run_summaries(self):
         status, payload = self.request("/api/history")

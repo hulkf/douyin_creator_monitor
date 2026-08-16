@@ -9,6 +9,7 @@ const state = {
   accountPool: { profiles: [] },
   history: { stats: {}, runs: [] },
   funnel: null,
+  permissions: { checks: [], total: 0, checked: 0, passed: 0, all_passed: false },
   lastStatus: null,
 };
 
@@ -256,6 +257,89 @@ function formatDuration(seconds) {
 
 function statusText(status) {
   return ({ Ready: "待命", Running: "运行中", running: "进行中", Disabled: "已禁用", success: "成功", partial_failure: "部分失败", failed: "失败", planned: "计划", never: "尚未运行", ready: "已有数据", not_run: "无数据" })[status] || status || "未知";
+}
+
+function renderPermissionChecks(data) {
+  state.permissions = data;
+  const total = Number(data.total || 0);
+  const checked = Number(data.checked || 0);
+  const passed = Number(data.passed || 0);
+  const percent = total ? Math.round((checked / total) * 100) : 100;
+  const fill = el("permission-progress-fill");
+  fill.style.width = `${percent}%`;
+  fill.className = data.all_passed ? "ready" : checked >= total ? "failed" : "";
+  const track = fill.parentElement;
+  track.setAttribute("aria-valuenow", String(percent));
+  el("permission-progress-count").textContent = `${checked} / ${total}`;
+  el("permission-progress-title").textContent = data.all_passed
+    ? `全部 ${passed} 项检查通过`
+    : `已通过 ${passed} 项，${Math.max(0, total - passed)} 项需要处理`;
+  el("permission-progress-note").textContent = total
+    ? "任务开始前先处理红灯项，可降低运行中断概率"
+    : "当前没有可检查的账号依赖";
+  el("permission-scope-note").textContent = data.scope_note || "绿色表示检查通过，红色表示需要处理。";
+
+  const list = el("permission-check-list");
+  list.replaceChildren();
+  (data.checks || []).forEach((check) => {
+    const item = document.createElement("article");
+    item.className = "permission-check-item";
+    const light = document.createElement("span");
+    light.className = `permission-light ${check.status || "failed"}`;
+    light.title = check.status === "ready" ? "检查通过" : check.status === "running" ? "登录进行中" : "检查失败";
+    const copy = document.createElement("div"); copy.className = "permission-check-copy";
+    const title = document.createElement("strong"); title.textContent = check.label;
+    const detail = document.createElement("small"); detail.textContent = check.detail;
+    copy.append(title, detail); item.append(light, copy);
+    if (check.action) {
+      const button = document.createElement("button");
+      button.type = "button"; button.className = "button secondary small permission-check-action";
+      button.textContent = check.action.label || "处理";
+      button.disabled = check.status === "running";
+      button.addEventListener("click", () => startPermissionLogin(check.action, button));
+      item.append(button);
+    }
+    list.append(item);
+  });
+  if (!(data.checks || []).length) {
+    const empty = document.createElement("div"); empty.className = "empty-cell"; empty.textContent = "当前没有启用的账号依赖";
+    list.append(empty);
+  }
+}
+
+async function loadPermissionChecks(showFeedback = false) {
+  try {
+    const payload = await api("/api/permissions");
+    renderPermissionChecks(payload);
+    if (showFeedback) toast(payload.all_passed ? "账号权限检查全部通过" : "账号权限检查已刷新，请处理红灯项", payload.all_passed ? "success" : "error");
+  } catch (error) {
+    el("permission-progress-title").textContent = "账号权限检查失败";
+    el("permission-progress-note").textContent = error.message;
+    if (showFeedback) toast(error.message, "error");
+  }
+}
+
+async function startPermissionLogin(action, button) {
+  if (action.type === "config") {
+    state.activeConfigCategory = action.category || "general";
+    switchTab("config");
+    if (state.config) renderConfig();
+    toast("已定位到对应配置；敏感凭据仍保存在 local/ 或环境变量中");
+    return;
+  }
+  if (action.type !== "douyin_login") return;
+  button.disabled = true;
+  try {
+    const result = await api("/api/accounts/login", {
+      method: "POST",
+      body: JSON.stringify({ profile_key: action.profile_key }),
+    });
+    toast(result.message || "扫码登录窗口已打开");
+    await loadPermissionChecks(false);
+  } catch (error) {
+    toast(error.message, "error");
+    button.disabled = false;
+  }
 }
 
 function renderStatus(data) {
@@ -1101,6 +1185,11 @@ async function saveConfig() {
 async function runNow() {
   const button = el("run-button"); button.disabled = true;
   try {
+    const permissions = await api("/api/permissions");
+    renderPermissionChecks(permissions);
+    if (!permissions.all_passed) {
+      throw new Error("启动前账号权限准备检查仍有红灯，请先完成登录或凭据配置");
+    }
     const payload = await api("/api/run", { method: "POST", body: "{}" });
     toast(payload.message || "已请求启动定时任务");
     setTimeout(() => loadStatus(false), 1200);
@@ -1119,7 +1208,7 @@ function switchTab(tab) {
   })[tab] || "项目总览";
   // “立即运行”只在“当前任务”页出现：总览与历史是只读页面，没有可执行的东西。
   el("run-button").style.display = tab === "current" ? "" : "none";
-  if (tab === "current") loadStatus(false);
+  if (tab === "current") Promise.all([loadStatus(false), loadPermissionChecks(false)]);
   if (tab === "history") loadHistory(false);
 }
 
@@ -1131,13 +1220,15 @@ async function refreshActivePage() {
     return;
   }
   if (state.activeTab === "config") return loadConfig(true);
-  return loadStatus(true);
+  await Promise.all([loadStatus(false), loadPermissionChecks(false)]);
+  toast("当前任务与账号权限状态已刷新");
 }
 
 document.querySelectorAll("[data-tab-target]").forEach((button) => button.addEventListener("click", () => switchTab(button.dataset.tabTarget)));
 el("refresh-button").addEventListener("click", refreshActivePage);
 el("run-button").addEventListener("click", runNow);
 el("headless-toggle").addEventListener("change", onHeadlessToggle);
+el("permission-refresh-button").addEventListener("click", () => loadPermissionChecks(true));
 el("save-config-button").addEventListener("click", saveConfig);
 el("config-form").addEventListener("input", markDirty);
 el("config-form").addEventListener("change", markDirty);
@@ -1156,6 +1247,7 @@ loadStatus(false);
 loadHistory(false);
 loadConfig(false);
 loadFunnel(false);
+loadPermissionChecks(false);
 setInterval(() => { if (["overview", "current"].includes(state.activeTab)) loadStatus(false); }, 12_000);
 setInterval(() => { if (["overview", "history"].includes(state.activeTab)) loadHistory(false); }, 30_000);
 setInterval(() => {
@@ -1163,3 +1255,4 @@ setInterval(() => {
     loadAccountPoolStatus(false);
   }
 }, 3_000);
+setInterval(() => { if (state.activeTab === "current") loadPermissionChecks(false); }, 12_000);

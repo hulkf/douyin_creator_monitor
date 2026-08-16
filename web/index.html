@@ -195,6 +195,30 @@
         </section>
 
         <section class="tab-page" id="tab-current">
+          <section class="panel permission-check-panel" id="permission-check-panel">
+            <div class="panel-header compact">
+              <div>
+                <p class="panel-kicker">STARTUP PERMISSION CHECK</p>
+                <h2>启动前账号权限准备检查</h2>
+              </div>
+              <button class="button secondary small" id="permission-refresh-button" type="button">重新检查</button>
+            </div>
+            <div class="permission-progress-summary">
+              <div>
+                <strong id="permission-progress-title">正在检查项目账号…</strong>
+                <small id="permission-progress-note">逐项确认本地登录态与凭据是否已准备</small>
+              </div>
+              <span id="permission-progress-count">0 / 0</span>
+            </div>
+            <div class="permission-progress-track" role="progressbar" aria-label="账号权限检查进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+              <span id="permission-progress-fill"></span>
+            </div>
+            <div class="permission-check-list" id="permission-check-list">
+              <div class="empty-cell">正在读取账号权限状态…</div>
+            </div>
+            <p class="permission-scope-note" id="permission-scope-note">绿色表示本地准备检查通过，红色表示需要处理。</p>
+          </section>
+
           <div class="metric-grid">
             <article class="metric-card coral">
               <div class="metric-icon">▶</div>
