@@ -10,6 +10,7 @@ const state = {
   history: { stats: {}, runs: [] },
   funnel: null,
   permissions: { checks: [], total: 0, checked: 0, passed: 0, all_passed: false },
+  imaCredentials: { configured: false, client_id_configured: false, api_key_configured: false },
   lastStatus: null,
 };
 
@@ -123,6 +124,7 @@ const sectionDefinitions = [
       {
         title: "腾讯 IMA 知识库",
         description: "最终文案备份到 IMA 知识库或达人文件夹。",
+        credentialEditor: "ima",
         fields: [
           ["ima.enabled", "启用 IMA", "boolean", "备份最终文案到腾讯 IMA。", true],
           ["ima.mapping", "IMA 映射文件", "text", "达人到知识库/文件夹的本地映射。"],
@@ -802,6 +804,79 @@ function createField(definition, value, path, creatorKey = null) {
   return wrapper;
 }
 
+function renderImaCredentialEditor() {
+  const editor = document.createElement("div"); editor.className = "ima-credential-editor";
+  editor.addEventListener("input", (event) => event.stopPropagation());
+  editor.addEventListener("change", (event) => event.stopPropagation());
+  const heading = document.createElement("div"); heading.className = "credential-editor-heading";
+  const title = document.createElement("strong"); title.textContent = "IMA OpenAPI 凭据";
+  const status = document.createElement("span");
+  status.className = `account-state-badge ${state.imaCredentials.configured ? "ready" : "failed"}`;
+  status.textContent = state.imaCredentials.configured ? "已安全配置" : "尚未配置";
+  heading.append(title, status);
+
+  const fields = document.createElement("div"); fields.className = "fields credential-fields";
+  const createPasswordField = (labelText, placeholder) => {
+    const wrapper = document.createElement("div"); wrapper.className = "field";
+    const label = document.createElement("label"); label.textContent = labelText;
+    const input = document.createElement("input"); input.type = "password";
+    input.autocomplete = "new-password"; input.placeholder = placeholder;
+    const help = document.createElement("small"); help.textContent = "现有值不会回显；填写后将覆盖本机保存值。";
+    wrapper.append(label, input, help);
+    return { wrapper, input };
+  };
+  const client = createPasswordField("Client ID", "输入新的 Client ID");
+  const apiKey = createPasswordField("API Key", "输入新的 API Key");
+  fields.append(client.wrapper, apiKey.wrapper);
+
+  const actions = document.createElement("div"); actions.className = "credential-editor-actions";
+  const note = document.createElement("small"); note.textContent = "仅写入被 Git 忽略的 local/ima.env.json，不进入项目配置或页面响应。";
+  const save = document.createElement("button"); save.type = "button"; save.className = "button primary";
+  save.textContent = state.imaCredentials.configured ? "覆盖保存凭据" : "保存凭据";
+  save.addEventListener("click", () => saveImaCredentials(client.input, apiKey.input, save));
+  actions.append(note, save); editor.append(heading, fields, actions);
+  return editor;
+}
+
+async function loadImaCredentialStatus() {
+  state.imaCredentials = await api("/api/credentials/ima");
+}
+
+async function saveImaCredentials(clientInput, apiKeyInput, button) {
+  const clientId = clientInput.value.trim();
+  const apiKey = apiKeyInput.value.trim();
+  if (!clientId || !apiKey) {
+    toast("Client ID 和 API Key 都必须填写", "error");
+    return;
+  }
+  button.disabled = true;
+  try {
+    const result = await api("/api/credentials/ima", {
+      method: "PUT",
+      body: JSON.stringify({ client_id: clientId, api_key: apiKey }),
+    });
+    clientInput.value = "";
+    apiKeyInput.value = "";
+    state.imaCredentials = {
+      configured: Boolean(result.configured),
+      client_id_configured: Boolean(result.configured),
+      api_key_configured: Boolean(result.configured),
+    };
+    const editor = button.closest(".ima-credential-editor");
+    const status = editor?.querySelector(".account-state-badge");
+    if (status) {
+      status.className = "account-state-badge ready";
+      status.textContent = "已安全配置";
+    }
+    button.textContent = "覆盖保存凭据";
+    await loadPermissionChecks(false);
+    toast(result.message || "IMA 凭据已保存");
+  } catch (error) {
+    toast(error.message, "error");
+    button.disabled = false;
+  }
+}
+
 function configSectionShell(definition) {
   const section = document.createElement("section");
   section.className = "config-section config-section-active";
@@ -846,7 +921,9 @@ function renderStandardConfigSection(definition) {
       groupDefinition.fields.forEach((fieldDefinition) => {
         fields.append(createField(fieldDefinition, getPath(state.config, fieldDefinition[0]), fieldDefinition[0]));
       });
-      group.append(head, fields); groups.append(group);
+      group.append(head, fields);
+      if (groupDefinition.credentialEditor === "ima") group.append(renderImaCredentialEditor());
+      groups.append(group);
     });
     section.append(groups);
     return section;
@@ -1152,7 +1229,7 @@ async function loadConfig(showFeedback = false) {
     if (!Array.isArray(state.config.collection.account_profiles)) state.config.collection.account_profiles = [];
     el("config-path").textContent = payload.path;
     markClean();
-    await loadAccountPoolStatus(false);
+    await Promise.all([loadAccountPoolStatus(false), loadImaCredentialStatus()]);
     renderConfig();
     const notice = el("config-notice");
     if (!payload.exists) {

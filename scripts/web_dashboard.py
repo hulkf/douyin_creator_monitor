@@ -38,12 +38,14 @@ from collect_douyin_creator_with_mediacrawler import (  # noqa: E402
 CONFIG_RELATIVE_PATH = Path("local") / "pipeline.json"
 CONFIG_BACKUP_RELATIVE_PATH = Path("local") / "pipeline.backup.json"
 CONFIG_TEMPLATE_RELATIVE_PATH = Path("config") / "pipeline.example.json"
+IMA_CREDENTIALS_RELATIVE_PATH = Path("local") / "ima.env.json"
 WEB_DIR_RELATIVE_PATH = Path("web")
 MAX_REQUEST_BYTES = 2 * 1024 * 1024
 MAX_HISTORY_FILES = 100
 DEFAULT_HISTORY_LIMIT = 30
 CREATOR_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 _CONFIG_LOCK = threading.Lock()
+_CREDENTIAL_LOCK = threading.Lock()
 _ACCOUNT_LOGIN_LOCK = threading.Lock()
 _ACCOUNT_LOGIN_PROCESSES: dict[str, subprocess.Popen[Any]] = {}
 
@@ -324,6 +326,85 @@ def save_pipeline_config(config: Any, project_dir: Path = PROJECT_DIR) -> SavedC
         finally:
             temp_path.unlink(missing_ok=True)
     return SavedConfig(path, actual_backup)
+
+
+def _ima_credentials(project_dir: Path) -> dict[str, Any]:
+    path = project_dir.resolve() / IMA_CREDENTIALS_RELATIVE_PATH
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError) as exc:
+        raise WebDashboardError("IMA 本地凭据文件无法读取，请检查 local/ima.env.json") from exc
+    if not isinstance(payload, dict):
+        raise WebDashboardError("IMA 本地凭据文件必须是 JSON 对象")
+    return payload
+
+
+def ima_credentials_status(project_dir: Path = PROJECT_DIR) -> dict[str, bool]:
+    try:
+        payload = _ima_credentials(project_dir)
+    except WebDashboardError:
+        payload = {}
+    client_id = str(
+        payload.get("IMA_OPENAPI_CLIENTID") or payload.get("client_id") or ""
+    ).strip()
+    api_key = str(
+        payload.get("IMA_OPENAPI_APIKEY") or payload.get("api_key") or ""
+    ).strip()
+    return {
+        "configured": bool(client_id and api_key),
+        "client_id_configured": bool(client_id),
+        "api_key_configured": bool(api_key),
+    }
+
+
+def save_ima_credentials(
+    client_id: Any,
+    api_key: Any,
+    project_dir: Path = PROJECT_DIR,
+) -> dict[str, Any]:
+    client_id = str(client_id or "").strip()
+    api_key = str(api_key or "").strip()
+    if not client_id or not api_key:
+        raise WebDashboardError("Client ID 和 API Key 都必须填写")
+    if len(client_id) > 256 or len(api_key) > 4096:
+        raise WebDashboardError("IMA 凭据长度异常")
+    if any(char in client_id or char in api_key for char in ("\r", "\n", "\0")):
+        raise WebDashboardError("IMA 凭据不能包含换行或空字符")
+
+    project_dir = project_dir.resolve()
+    path = project_dir / IMA_CREDENTIALS_RELATIVE_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _CREDENTIAL_LOCK:
+        try:
+            current = _ima_credentials(project_dir)
+        except WebDashboardError:
+            current = {}
+        current["IMA_OPENAPI_CLIENTID"] = client_id
+        current["IMA_OPENAPI_APIKEY"] = api_key
+        current.pop("client_id", None)
+        current.pop("api_key", None)
+        temporary = tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            delete=False,
+            dir=path.parent,
+            prefix=".ima.env.",
+            suffix=".tmp",
+        )
+        temp_path = Path(temporary.name)
+        try:
+            with temporary:
+                json.dump(current, temporary, ensure_ascii=False, indent=2)
+                temporary.write("\n")
+                temporary.flush()
+                os.fsync(temporary.fileno())
+            os.replace(temp_path, path)
+        finally:
+            temp_path.unlink(missing_ok=True)
+    return {"message": "IMA 凭据已安全保存", "configured": True}
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -1158,6 +1239,8 @@ def make_handler(
                     self._json(HTTPStatus.OK, account_status_provider(project_dir))
                 elif path == "/api/permissions":
                     self._json(HTTPStatus.OK, permission_provider(project_dir))
+                elif path == "/api/credentials/ima":
+                    self._json(HTTPStatus.OK, ima_credentials_status(project_dir))
                 elif path == "/api/history":
                     self._json(HTTPStatus.OK, history_provider(project_dir))
                 elif path == "/api/funnel":
@@ -1170,7 +1253,22 @@ def make_handler(
                 self._error(HTTPStatus.SERVICE_UNAVAILABLE, str(exc))
 
         def do_PUT(self) -> None:  # noqa: N802
-            if urlsplit(self.path).path != "/api/config":
+            request_path = urlsplit(self.path).path
+            if request_path == "/api/credentials/ima":
+                try:
+                    payload = self._read_json()
+                    if not isinstance(payload, dict):
+                        raise WebDashboardError("请求必须是 JSON 对象")
+                    result = save_ima_credentials(
+                        payload.get("client_id"), payload.get("api_key"), project_dir,
+                    )
+                    self._json(HTTPStatus.OK, result)
+                except WebDashboardError as exc:
+                    self._error(HTTPStatus.BAD_REQUEST, str(exc))
+                except Exception:
+                    self._error(HTTPStatus.INTERNAL_SERVER_ERROR, "IMA 凭据保存失败")
+                return
+            if request_path != "/api/config":
                 self._error(HTTPStatus.NOT_FOUND, "接口不存在")
                 return
             try:

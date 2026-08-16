@@ -114,6 +114,41 @@ class WebDashboardConfigTests(unittest.TestCase):
             self.assertEqual(result.path, path)
             self.assertEqual(result.backup_path, backup)
 
+    def test_ima_credentials_are_saved_locally_without_being_returned(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "local").mkdir()
+            path = root / "local" / "ima.env.json"
+            path.write_text(json.dumps({"unrelated": "preserved"}), encoding="utf-8")
+
+            result = WEB.save_ima_credentials("client-value", "api-secret", root)
+            status = WEB.ima_credentials_status(root)
+
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["IMA_OPENAPI_CLIENTID"], "client-value")
+            self.assertEqual(saved["IMA_OPENAPI_APIKEY"], "api-secret")
+            self.assertEqual(saved["unrelated"], "preserved")
+            self.assertEqual(result, {"message": "IMA 凭据已安全保存", "configured": True})
+            self.assertEqual(status, {
+                "configured": True,
+                "client_id_configured": True,
+                "api_key_configured": True,
+            })
+            self.assertNotIn("client-value", json.dumps(status))
+            self.assertNotIn("api-secret", json.dumps(status))
+
+    def test_ima_credentials_can_replace_a_malformed_local_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "local" / "ima.env.json"
+            path.parent.mkdir(parents=True)
+            path.write_text("not json", encoding="utf-8")
+
+            self.assertFalse(WEB.ima_credentials_status(root)["configured"])
+            WEB.save_ima_credentials("client-value", "api-secret", root)
+
+            self.assertTrue(WEB.ima_credentials_status(root)["configured"])
+
     def test_account_pool_status_detects_persisted_profile_cookie(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -506,6 +541,20 @@ class WebDashboardStaticTests(unittest.TestCase):
         self.assertNotIn('key: "kuake"', javascript)
         self.assertNotIn('key: "obsidian"', javascript)
 
+    def test_ima_credentials_use_write_only_password_inputs(self):
+        project_dir = Path(__file__).resolve().parents[1]
+        javascript = (project_dir / "web" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn('api("/api/credentials/ima")', javascript)
+        self.assertIn('function renderImaCredentialEditor', javascript)
+        self.assertIn('input.type = "password"', javascript)
+        self.assertIn('input.autocomplete = "new-password"', javascript)
+        self.assertIn('clientInput.value = ""', javascript)
+        self.assertIn('apiKeyInput.value = ""', javascript)
+        self.assertIn('event.stopPropagation()', javascript)
+        self.assertIn('button.closest(".ima-credential-editor")', javascript)
+        self.assertNotIn("IMA_OPENAPI_APIKEY", javascript)
+
     def test_account_pool_ui_explains_ordered_primary_and_backup_roles(self):
         project_dir = Path(__file__).resolve().parents[1]
         javascript = (project_dir / "web" / "app.js").read_text(encoding="utf-8")
@@ -653,6 +702,24 @@ class WebDashboardHttpTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(payload["all_passed"])
         self.permission_provider.assert_called_once_with(self.root)
+
+    def test_ima_credentials_api_never_returns_secret_values(self):
+        status, payload = self.request(
+            "/api/credentials/ima",
+            method="PUT",
+            payload={"client_id": "client-value", "api_key": "api-secret"},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["configured"])
+        self.assertNotIn("client-value", json.dumps(payload))
+        self.assertNotIn("api-secret", json.dumps(payload))
+
+        status, payload = self.request("/api/credentials/ima")
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["configured"])
+        self.assertNotIn("client-value", json.dumps(payload))
+        self.assertNotIn("api-secret", json.dumps(payload))
 
     def test_history_api_returns_plain_language_run_summaries(self):
         status, payload = self.request("/api/history")

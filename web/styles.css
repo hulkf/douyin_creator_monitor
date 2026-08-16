@@ -207,6 +207,12 @@ pre { margin: 0; min-height: 175px; max-height: 310px; overflow: auto; padding: 
 .backup-config-group-head h3 { margin: 0; font-size: 15px; }
 .backup-config-group-head p { margin: 6px 0 0; color: var(--muted); font-size: 13px; line-height: 1.5; }
 .backup-config-group .fields { padding: 17px; }
+.ima-credential-editor { margin: 0 17px 17px; overflow: hidden; border: 1px solid #e0dcd5; border-radius: 10px; background: #fff; }
+.credential-editor-heading { padding: 12px 14px; display: flex; align-items: center; justify-content: space-between; gap: 12px; border-bottom: 1px solid #eeeae4; background: #faf8f5; }
+.credential-editor-heading strong { font-size: 13px; }
+.credential-fields { padding: 14px; }
+.credential-editor-actions { padding: 0 14px 14px; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.credential-editor-actions small { max-width: 680px; color: var(--muted); font-size: 10px; line-height: 1.5; }
 .switch { position: relative; width: 34px; height: 19px; flex: 0 0 auto; }
 .switch input { position: absolute; opacity: 0; }
 .switch span { position: absolute; inset: 0; border-radius: 999px; background: #ccc9c3; transition: .2s; }
