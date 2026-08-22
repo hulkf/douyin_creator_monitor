@@ -55,8 +55,18 @@ def retryable_feishu_write_error(payload: Any) -> bool:
     except (TypeError, ValueError):
         code = 0
     message = str(error.get("message") or "").casefold()
+    error_type = str(error.get("type") or "").casefold()
+    error_subtype = str(error.get("subtype") or "").casefold()
     return code in RETRYABLE_FEISHU_WRITE_CODES or (
         "limited" in message or "write conflict" in message or "too many request" in message
+    ) or (
+        error_type == "network"
+        and (
+            error_subtype == "transport"
+            or any(marker in message for marker in (
+                "eof", "connection reset", "connection closed", "timed out", "timeout",
+            ))
+        )
     )
 
 
@@ -167,6 +177,8 @@ def load_existing_records(
 
 
 MARKDOWN_LINK_RE = re.compile(r"^\[[^]]*\]\((https?://[^)]+)\)$")
+LEGACY_DATETIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
+ISO_DATETIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$")
 VOLATILE_SYNC_FIELDS = {"最近采集时间", "记录时间"}
 
 
@@ -174,8 +186,20 @@ def normalized_cell(value: Any) -> Any:
     if isinstance(value, list) and len(value) == 1:
         return normalized_cell(value[0])
     if isinstance(value, str):
-        match = MARKDOWN_LINK_RE.match(value.strip())
-        return match.group(1) if match else value.strip()
+        text = value.strip()
+        match = MARKDOWN_LINK_RE.match(text)
+        if match:
+            return match.group(1)
+        try:
+            if LEGACY_DATETIME_RE.match(text):
+                moment = datetime.strptime(text, "%Y-%m-%d %H:%M:%S").replace(tzinfo=BEIJING_TZ)
+                return ("datetime_ms", int(moment.timestamp() * 1000))
+            if ISO_DATETIME_RE.match(text):
+                moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+                return ("datetime_ms", int(moment.timestamp() * 1000))
+        except ValueError:
+            pass
+        return text
     return value
 
 

@@ -52,8 +52,10 @@ FIELD_RULES: dict[str, dict[str, Any]] = {
                        note="纯数字账号ID；采集期从抖音 aweme/post 接口 author.uid 抓取（真实，非污染假账号），"
                             "用 sec_uid 校验是本人；非空必为纯数字且与 SecUID 不同；无来源时留空，绝不填成 SecUID"),
     "账号ID":     dict(owner=PROFILE, required=True,  kind="str", note="抖音号 handle，如 zaoweilai8（不是数字 UID）"),
-    "IP属地":     dict(owner=PROFILE, required=True,  kind="str"),
-    "所在地区":   dict(owner=PROFILE, required=True,  kind="str"),
+    "IP属地":     dict(owner=PROFILE, required=False, kind="str",
+                       note="可选；抓到才更新，缺失时不清空历史值，也不影响采集成功"),
+    "所在地区":   dict(owner=PROFILE, required=False, kind="str",
+                       note="可选；抓到才更新，缺失时不清空历史值，也不影响采集成功"),
     "性别":       dict(owner=PROFILE, required=False, kind="enum:男,女,未知",
                        note="抖音主页常不暴露性别，非必填；抓到才填，无则不写（不覆盖历史值）"),
     "关注数":     dict(owner=PROFILE, required=True,  kind="int"),

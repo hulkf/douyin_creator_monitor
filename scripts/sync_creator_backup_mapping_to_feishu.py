@@ -146,9 +146,9 @@ def search_creator_record(
         offset += 200
     unique = list(dict.fromkeys(matches))
     if not unique:
-        raise MappingSyncError(f"??????????? {match_field}={match_value}?")
+        raise MappingSyncError(f"达人基础信息表中未找到 {match_field}={match_value}。")
     if len(unique) > 1:
-        raise MappingSyncError(f"???????? {match_field}={match_value} ????????")
+        raise MappingSyncError(f"达人基础信息表中 {match_field}={match_value} 匹配到多条记录。")
     return unique[0]
 
 

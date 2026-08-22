@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>抖音达人监控 · 模块解耦架构图（2026-08-16）</title>
+<style>
+  :root{
+    --bg:#15171c; --panel:#1e2128; --panel2:#242833; --ink:#e8eaf0; --muted:#9aa3b2;
+    --red:#ff6b6b; --purple:#c79bff; --blue:#5ab0ff; --green:#7ee787; --gold:#ffd479;
+    --line:#3a4150;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0;background:var(--bg);color:var(--ink);
+    font-family:"PingFang SC","Microsoft YaHei","Segoe UI",system-ui,sans-serif;}
+  .wrap{max-width:1040px;margin:0 auto;padding:28px 20px 56px;}
+  h1{font-size:22px;margin:0 0 6px;font-weight:700;}
+  .sub{color:var(--muted);font-size:13px;margin:0 0 22px;line-height:1.6;}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;
+    padding:18px 18px 8px;margin:0 0 26px;}
+  .card h2{font-size:16px;margin:0 0 4px;display:flex;align-items:center;gap:8px;}
+  .badge{font-size:11px;padding:2px 8px;border-radius:999px;font-weight:600;}
+  .badge.now{background:rgba(255,107,107,.16);color:var(--red);border:1px solid rgba(255,107,107,.4);}
+  .badge.target{background:rgba(90,176,255,.16);color:var(--blue);border:1px solid rgba(90,176,255,.4);}
+  .cap{color:var(--muted);font-size:12.5px;line-height:1.7;margin:6px 2px 14px;}
+  svg{width:100%;height:auto;display:block;background:var(--panel2);border-radius:10px;}
+  .legend{display:flex;flex-wrap:wrap;gap:14px 22px;margin:10px 2px 4px;font-size:12.5px;color:var(--muted);}
+  .legend span{display:inline-flex;align-items:center;gap:7px;}
+  .chip{width:14px;height:14px;border-radius:4px;display:inline-block;border:1px solid rgba(255,255,255,.18);}
+  .footer{color:var(--muted);font-size:12px;line-height:1.7;border-top:1px solid var(--line);
+    padding-top:16px;margin-top:8px;}
+  .footer b{color:var(--ink);font-weight:600;}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>抖音达人监控项目 · 模块解耦架构图</h1>
+  <p class="sub">
+    设计人：架构师 高见远（Gao） · 2026-08-16 · 配套设计文档：<code>docs/architecture/decouple-design-2026-08-16.md</code><br/>
+    本图用「大白话 + 色块」展示：<b style="color:var(--ink)">现在的耦合问题</b> 与 <b style="color:var(--ink)">将来的分层柜子</b>。无需编程背景也能看懂。
+  </p>
+
+  <!-- ===================== 图一：当前耦合 ===================== -->
+  <div class="card">
+    <h2><span class="badge now">现在</span> 一个超大文件 + 一堆平铺脚本 + 直接读内部文件的控制面板</h2>
+    <p class="cap">
+      中间是一个近 3600 行的「上帝模块」<b style="color:var(--red)">run_creator_pipeline.py</b>，它一个人干了所有活：
+      记日志、读配置、管状态、管账号钥匙、还亲手拼出每一步的「命令行字符串」去喊兄弟脚本上班。
+      网页/桌面面板则直接翻它的内部文件、直接按定时任务按钮。箭头颜色含义见底部图例。
+    </p>
+    <svg viewBox="0 0 940 660" role="img" aria-label="当前耦合架构">
+      <defs>
+        <marker id="aRed" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+          <path d="M0,0 L9,4.5 L0,9 z" fill="#ff6b6b"/></marker>
+        <marker id="aPur" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+          <path d="M0,0 L9,4.5 L0,9 z" fill="#c79bff"/></marker>
+        <marker id="aGray" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+          <path d="M0,0 L9,4.5 L0,9 z" fill="#9aa3b2"/></marker>
+      </defs>
+
+      <!-- 共享契约 -->
+      <rect x="330" y="18" width="280" height="46" rx="9" fill="#2c3442" stroke="#9aa3b2" stroke-dasharray="5 4"/>
+      <text x="470" y="38" text-anchor="middle" fill="#e8eaf0" font-size="13" font-weight="600">共享契约（散落在 scripts/）</text>
+      <text x="470" y="55" text-anchor="middle" fill="#9aa3b2" font-size="11">work_table_schema / creator_table_fields</text>
+
+      <!-- 左列脚本 -->
+      <g font-size="13" fill="#e8eaf0" text-anchor="middle">
+        <rect x="20" y="100" width="180" height="46" rx="8" fill="#2a2f3a" stroke="#3a4150"/>
+        <text x="110" y="127">采集脚本</text>
+        <rect x="20" y="180" width="180" height="46" rx="8" fill="#2a2f3a" stroke="#3a4150"/>
+        <text x="110" y="207">转写脚本</text>
+        <rect x="20" y="260" width="180" height="46" rx="8" fill="#2a2f3a" stroke="#3a4150"/>
+        <text x="110" y="287">纠正脚本</text>
+        <rect x="20" y="340" width="180" height="46" rx="8" fill="#2a2f3a" stroke="#3a4150"/>
+        <text x="110" y="367">状态回写脚本</text>
+        <rect x="20" y="420" width="180" height="46" rx="8" fill="#2a2f3a" stroke="#3a4150"/>
+        <text x="110" y="447">IMA 备份脚本</text>
+      </g>
+
+      <!-- 右列脚本 -->
+      <g font-size="13" fill="#e8eaf0" text-anchor="middle">
+        <rect x="740" y="100" width="180" height="46" rx="8" fill="#2a2f3a" stroke="#3a4150"/>
+        <text x="830" y="127">飞书同步脚本</text>
+        <rect x="740" y="180" width="180" height="46" rx="8" fill="#2a2f3a" stroke="#3a4150"/>
+        <text x="830" y="207">总结脚本</text>
+        <rect x="740" y="260" width="180" height="46" rx="8" fill="#2a2f3a" stroke="#3a4150"/>
+        <text x="830" y="287">回写脚本</text>
+        <rect x="740" y="340" width="180" height="46" rx="8" fill="#2a2f3a" stroke="#3a4150"/>
+        <text x="830" y="367">夸克备份脚本</text>
+        <rect x="740" y="420" width="180" height="46" rx="8" fill="#2a2f3a" stroke="#3a4150"/>
+        <text x="830" y="447">Obsidian 脚本</text>
+      </g>
+
+      <!-- 上帝模块 -->
+      <rect x="330" y="200" width="280" height="170" rx="12" fill="#3a1f24" stroke="#ff6b6b" stroke-width="2"/>
+      <text x="470" y="232" text-anchor="middle" fill="#ff9a9a" font-size="14" font-weight="700">上帝模块</text>
+      <text x="470" y="254" text-anchor="middle" fill="#ffd0d0" font-size="13">run_creator_pipeline.py</text>
+      <text x="470" y="278" text-anchor="middle" fill="#ff9a9a" font-size="12">≈ 3600 行，什么都在里面</text>
+      <line x1="360" y1="296" x2="580" y2="296" stroke="#ff6b6b" stroke-dasharray="3 3" opacity=".5"/>
+      <text x="470" y="318" text-anchor="middle" fill="#ffd0d0" font-size="11">内嵌：账号钥匙/登录态锁 ~18 个函数</text>
+      <text x="470" y="336" text-anchor="middle" fill="#ffd0d0" font-size="11">日志 · 配置 · 状态 · 命令拼装</text>
+      <text x="470" y="356" text-anchor="middle" fill="#ffd0d0" font-size="11">主编排循环</text>
+
+      <!-- 控制层 -->
+      <g font-size="13" fill="#e8eaf0" text-anchor="middle">
+        <rect x="110" y="560" width="180" height="48" rx="8" fill="#2c2438" stroke="#c79bff"/>
+        <text x="200" y="589">网页面板</text>
+        <rect x="650" y="560" width="180" height="48" rx="8" fill="#2c2438" stroke="#c79bff"/>
+        <text x="740" y="589">桌面面板</text>
+        <rect x="400" y="560" width="140" height="48" rx="8" fill="#2c2438" stroke="#c79bff"/>
+        <text x="470" y="578">schtasks</text>
+        <text x="470" y="595" font-size="11" fill="#c79bff">定时任务</text>
+        <rect x="400" y="450" width="140" height="40" rx="8" fill="#23303a" stroke="#9aa3b2" stroke-dasharray="5 4"/>
+        <text x="470" y="475" font-size="11" fill="#9aa3b2">runtime 内部 JSON</text>
+      </g>
+
+      <!-- 箭头：脚本 → 上帝模块（红，拼命令行） -->
+      <g stroke="#ff6b6b" stroke-width="1.6" stroke-dasharray="6 4" fill="none" marker-end="url(#aRed)">
+        <line x1="200" y1="123" x2="328" y2="280"/>
+        <line x1="200" y1="203" x2="328" y2="300"/>
+        <line x1="200" y1="283" x2="328" y2="315"/>
+        <line x1="200" y1="363" x2="328" y2="330"/>
+        <line x1="200" y1="443" x2="328" y2="345"/>
+        <line x1="740" y1="123" x2="612" y2="280"/>
+        <line x1="740" y1="203" x2="612" y2="300"/>
+        <line x1="740" y1="283" x2="612" y2="315"/>
+        <line x1="740" y1="363" x2="612" y2="330"/>
+        <line x1="740" y1="443" x2="612" y2="345"/>
+      </g>
+
+      <!-- 箭头：契约 → 部分脚本（灰虚线） -->
+      <g stroke="#9aa3b2" stroke-width="1.3" stroke-dasharray="4 4" fill="none" marker-end="url(#aGray)">
+        <line x1="340" y1="64" x2="120" y2="100"/>
+        <line x1="600" y1="64" x2="820" y2="100"/>
+      </g>
+
+      <!-- 箭头：控制层 → 上帝模块（紫，import 内部） -->
+      <g stroke="#c79bff" stroke-width="1.6" fill="none" marker-end="url(#aPur)">
+        <line x1="230" y1="560" x2="360" y2="380"/>
+        <line x1="710" y1="560" x2="600" y2="380"/>
+      </g>
+      <!-- 控制层 → schtasks（紫虚线 立即运行） -->
+      <g stroke="#c79bff" stroke-width="1.4" stroke-dasharray="5 4" fill="none" marker-end="url(#aPur)">
+        <line x1="290" y1="584" x2="395" y2="584"/>
+        <line x1="650" y1="584" x2="540" y2="584"/>
+      </g>
+      <!-- 控制层 → runtime JSON（灰虚线 直接读） -->
+      <g stroke="#9aa3b2" stroke-width="1.3" stroke-dasharray="4 4" fill="none" marker-end="url(#aGray)">
+        <line x1="290" y1="560" x2="430" y2="490"/>
+        <line x1="650" y1="560" x2="510" y2="490"/>
+      </g>
+      <!-- 上帝模块 → runtime JSON（灰 产出） -->
+      <g stroke="#9aa3b2" stroke-width="1.3" fill="none" marker-end="url(#aGray)">
+        <line x1="470" y1="370" x2="470" y2="448"/>
+      </g>
+
+      <!-- 标注 -->
+      <text x="470" y="500" text-anchor="middle" fill="#ff6b6b" font-size="11">红虚线 = 拼命令行 + subprocess 喊兄弟脚本（一改就静默崩）</text>
+      <text x="470" y="618" text-anchor="middle" fill="#c79bff" font-size="11">紫 = 控制面板直接 import 内部模块 / 按定时任务按钮</text>
+    </svg>
+
+    <div class="legend">
+      <span><i class="chip" style="background:#ff6b6b"></i> 强耦合：命令行字符串调用</span>
+      <span><i class="chip" style="background:#c79bff"></i> 控制层直接 import / 触发</span>
+      <span><i class="chip" style="background:#9aa3b2"></i> 共享文件 / 契约 / 内部状态</span>
+    </div>
+  </div>
+
+  <!-- ===================== 图二：目标解耦 ===================== -->
+  <div class="card">
+    <h2><span class="badge target">将来</span> 分层柜子：只向下依赖，用「稳定接口」把各层隔开</h2>
+    <p class="cap">
+      把公共工具沉到最底层（<b style="color:var(--blue)">core 内核</b>），每个步骤变成一张标准「动作卡（Stage）」，
+      三处备份共用一个接口，账号钥匙独立成柜，网页/桌面面板只认一个稳定的 <b style="color:var(--blue)">ControlAPI</b>。
+      所有箭头<b style="color:var(--blue)">只朝下</b>，绝不回头——改任何一层都不会扯动别的层。
+    </p>
+    <svg viewBox="0 0 940 740" role="img" aria-label="目标解耦架构">
+      <defs>
+        <marker id="aBlue" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+          <path d="M0,0 L9,4.5 L0,9 z" fill="#5ab0ff"/></marker>
+        <marker id="aPur2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+          <path d="M0,0 L9,4.5 L0,9 z" fill="#c79bff"/></marker>
+        <marker id="aGray2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+          <path d="M0,0 L9,4.5 L0,9 z" fill="#9aa3b2"/></marker>
+      </defs>
+
+      <!-- 控制层 -->
+      <g font-size="13" fill="#e8eaf0" text-anchor="middle">
+        <rect x="130" y="20" width="170" height="44" rx="8" fill="#2c2438" stroke="#c79bff"/>
+        <text x="215" y="47">网页面板</text>
+        <rect x="640" y="20" width="170" height="44" rx="8" fill="#2c2438" stroke="#c79bff"/>
+        <text x="725" y="47">桌面面板</text>
+        <rect x="355" y="78" width="230" height="46" rx="9" fill="#33264d" stroke="#c79bff"/>
+        <text x="470" y="98" fill="#d9c2ff" font-weight="600">ControlAPI</text>
+        <text x="470" y="115" font-size="11" fill="#c79bff">稳定只读接口（面板只认它）</text>
+        <rect x="620" y="78" width="150" height="46" rx="8" fill="#2c2438" stroke="#c79bff"/>
+        <text x="695" y="96">schtasks</text>
+        <text x="695" y="113" font-size="11" fill="#c79bff">定时任务</text>
+        <rect x="355" y="140" width="230" height="34" rx="8" fill="#23303a" stroke="#9aa3b2" stroke-dasharray="5 4"/>
+        <text x="470" y="162" font-size="11" fill="#9aa3b2">只读 runtime 状态 / 配置</text>
+      </g>
+
+      <!-- 编排层 -->
+      <rect x="290" y="200" width="360" height="52" rx="10" fill="#1f3a5a" stroke="#5ab0ff" stroke-width="2"/>
+      <text x="470" y="222" text-anchor="middle" fill="#bfe0ff" font-size="14" font-weight="700">PipelineOrchestrator</text>
+      <text x="470" y="241" text-anchor="middle" fill="#9fd0ff" font-size="11.5">顺序 · 并发 · 断点续跑（不管每步命令行长相）</text>
+      <rect x="290" y="262" width="360" height="30" rx="8" fill="#16273b" stroke="#3a4150"/>
+      <text x="470" y="282" text-anchor="middle" fill="#9aa3b2" font-size="11.5">Stage 注册表：每张「动作卡」统一签名</text>
+
+      <!-- 稳定接口承重墙 -->
+      <rect x="80" y="308" width="780" height="32" rx="8" fill="#3a3320" stroke="#ffd479"/>
+      <text x="470" y="329" text-anchor="middle" fill="#ffe6ad" font-size="12.5" font-weight="600">
+        稳定接口承重墙：Stage 协议 · StorageBackend · AccountPool · LarkClient · Config
+      </text>
+
+      <!-- 业务模块层 -->
+      <g font-size="12.5" fill="#e8eaf0" text-anchor="middle">
+        <rect x="20" y="362" width="150" height="52" rx="8" fill="#223a26" stroke="#7ee787"/>
+        <text x="95" y="384">采集</text>
+        <text x="95" y="401" font-size="10.5" fill="#bfe9c6">MediaCrawler 唯一真源</text>
+
+        <rect x="185" y="362" width="110" height="52" rx="8" fill="#223a26" stroke="#7ee787"/>
+        <text x="240" y="390">转写</text>
+
+        <rect x="310" y="362" width="110" height="52" rx="8" fill="#223a26" stroke="#7ee787"/>
+        <text x="365" y="390">纠正</text>
+
+        <rect x="435" y="362" width="160" height="52" rx="8" fill="#223a26" stroke="#7ee787"/>
+        <text x="515" y="384">飞书读写</text>
+        <text x="515" y="401" font-size="10.5" fill="#bfe9c6">数据保护硬规则</text>
+
+        <rect x="610" y="362" width="210" height="52" rx="8" fill="#223a26" stroke="#7ee787"/>
+        <text x="715" y="384">三处备份</text>
+        <text x="715" y="401" font-size="10.5" fill="#bfe9c6">IMA / 夸克 / Obsidian</text>
+
+        <rect x="20" y="432" width="150" height="52" rx="8" fill="#223a26" stroke="#7ee787"/>
+        <text x="95" y="454">账号池</text>
+        <text x="95" y="471" font-size="10.5" fill="#bfe9c6">登录态锁·故障切换</text>
+      </g>
+
+      <!-- 内核层 -->
+      <g font-size="11.5" fill="#e8eaf0" text-anchor="middle">
+        <rect x="20" y="516" width="120" height="42" rx="7" fill="#1e2128" stroke="#5ab0ff"/>
+        <text x="80" y="541">Config</text>
+        <rect x="150" y="516" width="110" height="42" rx="7" fill="#1e2128" stroke="#5ab0ff"/>
+        <text x="205" y="541">Logger</text>
+        <rect x="270" y="516" width="110" height="42" rx="7" fill="#1e2128" stroke="#5ab0ff"/>
+        <text x="325" y="541">Runner</text>
+        <rect x="390" y="516" width="130" height="42" rx="7" fill="#1e2128" stroke="#5ab0ff"/>
+        <text x="455" y="541">ArtifactPaths</text>
+        <rect x="530" y="516" width="120" height="42" rx="7" fill="#1e2128" stroke="#5ab0ff"/>
+        <text x="590" y="541">WorkState</text>
+        <rect x="660" y="516" width="120" height="42" rx="7" fill="#1e2128" stroke="#5ab0ff"/>
+        <text x="720" y="541">LarkClient</text>
+
+        <rect x="20" y="572" width="240" height="40" rx="8" fill="#243042" stroke="#9aa3b2" stroke-dasharray="5 4"/>
+        <text x="140" y="596" font-size="11.5" fill="#cdd6e4">contracts 共享契约（表字段 / 校验）</text>
+      </g>
+
+      <!-- 依赖箭头（蓝色，单向向下） -->
+      <g stroke="#5ab0ff" stroke-width="1.5" fill="none" marker-end="url(#aBlue)">
+        <!-- 控制层 → 编排（经 schtasks 启动） -->
+        <line x1="695" y1="124" x2="560" y2="200"/>
+        <!-- 编排 → 业务模块 -->
+        <line x1="380" y1="252" x2="95" y2="360"/>
+        <line x1="430" y1="252" x2="240" y2="360"/>
+        <line x1="470" y1="252" x2="365" y2="360"/>
+        <line x1="520" y1="252" x2="515" y2="360"/>
+        <line x1="580" y1="252" x2="715" y2="360"/>
+        <!-- 编排 → 账号池 -->
+        <line x1="360" y1="262" x2="120" y2="430"/>
+        <!-- 业务模块 → 内核（代表箭头） -->
+        <line x1="95" y1="414" x2="80" y2="514"/>
+        <line x1="240" y1="414" x2="205" y2="514"/>
+        <line x1="365" y1="414" x2="325" y2="514"/>
+        <line x1="515" y1="414" x2="455" y2="514"/>
+        <line x1="715" y1="414" x2="720" y2="514"/>
+        <line x1="95" y1="484" x2="120" y2="514"/>
+      </g>
+
+      <!-- 控制层 → 内核（只读依赖，蓝色虚线，沿左侧） -->
+      <path d="M355,101 C180,140 120,300 90,514" stroke="#5ab0ff" stroke-width="1.4"
+            stroke-dasharray="6 4" fill="none" marker-end="url(#aBlue)"/>
+      <!-- 控制层 → runtime（灰虚线） -->
+      <g stroke="#9aa3b2" stroke-width="1.3" stroke-dasharray="4 4" fill="none" marker-end="url(#aGray2)">
+        <line x1="470" y1="174" x2="470" y2="358" opacity=".0"/>
+      </g>
+      <!-- ControlAPI → schtasks 触发 -->
+      <g stroke="#c79bff" stroke-width="1.4" fill="none" marker-end="url(#aPur2)">
+        <line x1="610" y1="101" x2="625" y2="101"/>
+      </g>
+
+      <!-- 标注 -->
+      <text x="470" y="640" text-anchor="middle" fill="#5ab0ff" font-size="11.5">蓝箭头 = 单向依赖（只向下，不回头、不循环）</text>
+      <text x="470" y="660" text-anchor="middle" fill="#ffd479" font-size="11.5">金条 = 稳定接口：换实现不影响别人；紫框 = 控制层只依赖 ControlAPI，不碰内部</text>
+    </svg>
+
+    <div class="legend">
+      <span><i class="chip" style="background:#5ab0ff"></i> 单向依赖（只向下）</span>
+      <span><i class="chip" style="background:#ffd479"></i> 稳定接口承重墙</span>
+      <span><i class="chip" style="background:#c79bff"></i> 控制层 / 触发定时任务</span>
+      <span><i class="chip" style="background:#7ee787"></i> 业务模块（采集/转写/纠正/飞书/备份/账号池）</span>
+      <span><i class="chip" style="background:#1e2128;border-color:#5ab0ff"></i> core 内核（公共工具）</span>
+    </div>
+  </div>
+
+  <div class="footer">
+    <p><b>一句话对照：</b>现在 = 一个 3600 行大抽屉，用便利贴（命令行）喊兄弟脚本，面板直接翻内部文件；
+    将来 = 分层带标签的柜子，公共工具沉底、每步一张标准动作卡、三处备份一个口、账号钥匙独立柜、面板只认稳定 API。</p>
+    <p><b>不变的东西：</b>平时一键启动的按钮、飞书「只新增+覆盖更新」、抖音仍走 MediaCrawler 采集、密钥与运行产物仍在被忽略的 <code>local/runtime/logs/</code> 里。
+    迁移采用「绞杀者模式」分 6 阶段，每阶段都能一键跑通、可回滚，绝不一次性大重写。</p>
+    <p style="color:#6b7280">本文件为单文件自包含（内联 CSS/SVG，无外部依赖），可离线双击打开。</p>
+  </div>
+</div>
+</body>
+</html>

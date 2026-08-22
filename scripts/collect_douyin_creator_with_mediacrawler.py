@@ -39,12 +39,11 @@ COLLECTION_STATE_VERSION = 1
 INTERACTIVE_LOGIN_EXIT_CODE = 86
 INTERACTIVE_LOGIN_ENV = "DOUYIN_INTERACTIVE_LOGIN"
 UNRELATED_CHROME_PIDS_ENV = "DOUYIN_UNRELATED_CHROME_PIDS"
-# Fields that must come from this run's user-profile response. Other required
-# Feishu fields are generated here (URL/status/check time) or derived from works
-# later (last post time).
+# Fields that must come from this run's user-profile response. Address fields
+# (IP属地/所在地区) are optional: save them when present, otherwise preserve any
+# historical non-empty value through merge_profile().
 PROFILE_CORE_FIELDS = (
-    "达人昵称", "账号ID", "IP属地", "所在地区",
-    "关注数", "粉丝数", "获赞数", "作品数",
+    "达人昵称", "账号ID", "关注数", "粉丝数", "获赞数", "作品数",
 )
 
 

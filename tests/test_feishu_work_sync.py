@@ -44,6 +44,35 @@ class FeishuWorkSyncTest(unittest.TestCase):
         self.assertEqual(run.call_count, 2)
         sleep.assert_called_once_with(1)
 
+    def test_transport_eof_is_retried(self):
+        eof = Mock(
+            returncode=1,
+            stdout="",
+            stderr=json.dumps({
+                "ok": False,
+                "identity": "user",
+                "error": {
+                    "type": "network",
+                    "subtype": "transport",
+                    "message": "API call failed: Get https://open.feishu.cn/fields: EOF",
+                },
+            }),
+        )
+        success = Mock(
+            returncode=0,
+            stdout=json.dumps({"ok": True, "identity": "user", "data": {}}),
+            stderr="",
+        )
+
+        with patch.object(
+            SYNC.subprocess, "run", side_effect=[eof, success],
+        ) as run, patch.object(SYNC.time, "sleep") as sleep:
+            payload = SYNC.run_lark("cli", ["base", "+field-list"])
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(run.call_count, 2)
+        sleep.assert_called_once_with(1)
+
     def test_work_patch_only_uses_canonical_schema_fields(self):
         patch_value = SYNC.build_patch(
             {
@@ -306,6 +335,38 @@ class FeishuWorkSyncTest(unittest.TestCase):
                 "cli", "base", "table", {"new": "rec-new"}, expected,
             )
         self.assertEqual(verified, 1)
+
+    def test_iso_readback_datetime_matches_legacy_written_datetime(self):
+        expected = {
+            "new": {
+                "抖音作品ID": "new", "发布时间": "2026-08-13 16:27:44",
+                "点赞数": 1, "评论数": 2, "收藏数": 3, "分享数": 4,
+            }
+        }
+        response = {
+            "data": {
+                "fields": list(SYNC.CORE_VERIFY_FIELDS),
+                "data": [["new", "2026-08-13T16:27:44.000+08:00", 1, 2, 3, 4]],
+                "record_id_list": ["rec-new"],
+            }
+        }
+        with patch.object(SYNC, "run_lark", return_value=response):
+            verified = SYNC.verify_written_records(
+                "cli", "base", "table", {"new": "rec-new"}, expected,
+            )
+        self.assertEqual(verified, 1)
+
+    def test_iso_readback_datetime_does_not_force_an_update(self):
+        work = {
+            "aweme_id": "same", "desc": "相同", "create_time": 1786608064,
+            "digg_count": 1, "comment_count": 2, "collect_count": 3, "share_count": 4,
+        }
+        patch_value = SYNC.build_patch(work, "2026-08-16 10:00:00")
+        existing_fields = dict(patch_value)
+        existing_fields["发布时间"] = "2026-08-13T16:01:04.000+08:00"
+        self.assertFalse(SYNC.has_content_changes(
+            {"record_id": "rec-same", "fields": existing_fields}, patch_value,
+        ))
 
 
 if __name__ == "__main__":

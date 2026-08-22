@@ -7,6 +7,8 @@ from pathlib import Path
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 RUN_DAILY = PROJECT_DIR / "run_daily.bat"
+RUN_SCHEDULED = PROJECT_DIR / "run_scheduled.bat"
+REGISTER_TASK = PROJECT_DIR / "scripts" / "register_scheduled_task.ps1"
 
 
 @unittest.skipUnless(os.name == "nt", "run_daily.bat is Windows-specific")
@@ -57,6 +59,15 @@ class RunDailyLauncherTest(unittest.TestCase):
         self.assertLess(source.index('set "LARK_CHANNEL="'), preflight)
         self.assertLess(preflight, reconcile)
         self.assertIn("exit /b %FEISHU_PREFLIGHT_EL%", source)
+
+    def test_scheduled_task_catches_up_after_a_missed_start(self):
+        source = REGISTER_TASK.read_text(encoding="utf-8-sig")
+        self.assertIn("-StartWhenAvailable", source)
+
+    def test_scheduled_launcher_rotates_logs_before_appending(self):
+        source = RUN_SCHEDULED.read_text(encoding="utf-8-sig")
+        self.assertIn("rotate_runtime_logs.py", source)
+        self.assertLess(source.index("rotate_runtime_logs.py"), source.index("task-launch.log"))
 
 
 if __name__ == "__main__":

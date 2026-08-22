@@ -13,7 +13,8 @@ set TN=DouyinCreatorMonitor
 set REGISTER_SCRIPT=%~dp0scripts\register_scheduled_task.ps1
 
 REM Run daily at 03:00. The PowerShell helper also sets a stable cmd launcher
-REM and project working directory. Interactive logon avoids storing a password.
+REM and project working directory. Interactive logon avoids storing a password;
+REM StartWhenAvailable catches up after the PC or user session misses 03:00.
 powershell -NoProfile -ExecutionPolicy Bypass -File "%REGISTER_SCRIPT%"
 set CREATE_EL=%errorlevel%
 if "%CREATE_EL%"=="0" schtasks /query /tn %TN% >nul 2>&1

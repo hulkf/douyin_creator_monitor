@@ -184,6 +184,60 @@ class IncrementalCollectionTest(unittest.TestCase):
             self.assertEqual(profile["主页采集状态"], "正常")
             self.assertEqual(profile["账号状态"], "正常")
 
+    def test_missing_ip_location_preserves_existing_value_without_partial_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            capture = root / "creator-profile-raw.json"
+            output = root / "profile-demo-update.json"
+            output.write_text(
+                json.dumps({"IP属地": "浙江", "粉丝数": 10}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            capture.write_text(
+                json.dumps({"user": {
+                    "nickname": "测试达人", "unique_id": "demo123",
+                    "sec_uid": "sec-demo", "province": "浙江", "city": "杭州",
+                    "following_count": 1, "follower_count": 11,
+                    "total_favorited": 12, "aweme_count": 13,
+                }}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            result = COLLECTOR.update_profile_from_capture(
+                capture, output, "https://www.douyin.com/user/sec-demo",
+            )
+            profile = json.loads(output.read_text(encoding="utf-8"))
+
+            self.assertTrue(result["updated"])
+            self.assertEqual(result["missing_core_fields"], [])
+            self.assertEqual(profile["IP属地"], "浙江")
+            self.assertEqual(profile["所在地区"], "浙江·杭州")
+            self.assertEqual(profile["粉丝数"], 11)
+
+    def test_missing_ip_location_is_ignored_when_no_history_exists(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            capture = root / "creator-profile-raw.json"
+            output = root / "profile-demo-update.json"
+            capture.write_text(
+                json.dumps({"user": {
+                    "nickname": "测试达人", "unique_id": "demo123",
+                    "sec_uid": "sec-demo",
+                    "following_count": 1, "follower_count": 11,
+                    "total_favorited": 12, "aweme_count": 13,
+                }}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            result = COLLECTOR.update_profile_from_capture(
+                capture, output, "https://www.douyin.com/user/sec-demo",
+            )
+            profile = json.loads(output.read_text(encoding="utf-8"))
+
+            self.assertTrue(result["updated"])
+            self.assertNotIn("IP属地", profile)
+            self.assertNotIn("所在地区", profile)
+
     def test_ip_location_fills_region_when_profile_has_no_province_or_city(self):
         payload = {
             "user": {

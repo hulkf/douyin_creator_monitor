@@ -27,6 +27,15 @@ OBSIDIAN = load_module("export_transcript_to_obsidian")
 
 
 class ImaDirectoryMappingTest(unittest.TestCase):
+    def test_auth_probe_calls_the_official_read_only_search_endpoint(self):
+        with patch.object(IMA, "ima_api", return_value={"info_list": []}) as mocked:
+            IMA.probe_credentials(IMA.ImaCredentials("client", "key"))
+        mocked.assert_called_once_with(
+            IMA.ImaCredentials("client", "key"),
+            "openapi/wiki/v1/search_knowledge_base",
+            {"query": "", "cursor": "", "limit": 20},
+        )
+
     def test_missing_creator_folder_is_created_and_persisted(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             mapping = Path(temp_dir) / "mapping.json"

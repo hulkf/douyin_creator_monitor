@@ -70,7 +70,7 @@
 |------|----------|
 | `scripts/check_and_onboard_new_creators.py` | `run_collect_profiles`（TTL line 812–834）、`_resolve_user_data_dir`（775–787）、`sync_profile_to_feishu`（只写非空，约 565） |
 | `scripts/collect_douyin_creator_profile.py` | `collect`（单次重试 4 次保留最全，543–572；response 监听抓真实抖音 UID） |
-| `scripts/creator_table_fields.py` | `PROFILE_FIELDS` 必填定义（粉丝/获赞/作品数/账号ID/IP属地/所在地区/关注数/最近发稿时间/账号状态 等必填） |
+| `scripts/creator_table_fields.py` | `PROFILE_FIELDS` 字段定义；IP属地/所在地区为可选字段，抓到才更新，缺失时保留历史值或忽略 |
 | `scripts/run_creator_pipeline.py` | `collect_command`（作品采集登录态目录 541/577）、`collect_creator_phase`（1745+） |
 | `run_daily.bat` | 调度顺序（reconcile→onboard→主流水线→profile 采集） |
 | `local/pipeline.json` | `collection.profile_ttl_hours`（当前未设，走默认 12）、`collection.profile_max_workers`（默认 3） |

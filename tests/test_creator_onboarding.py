@@ -93,6 +93,21 @@ class CreatorOnboardingTest(unittest.TestCase):
         self.assertNotIn("账号ID", patch_value)
         self.assertTrue(warnings)
 
+    def test_missing_address_fields_do_not_produce_required_field_warnings(self):
+        _, warnings = FIELDS.validate_profile_patch({
+            "达人主页地址": "https://www.douyin.com/user/sec",
+            "账号ID": "demo123",
+            "关注数": 1,
+            "粉丝数": 2,
+            "获赞数": 3,
+            "作品数": 4,
+            "最近发稿时间": "2026-08-16 11:00:00",
+            "账号状态": "正常",
+        })
+
+        self.assertFalse(any("IP属地" in warning for warning in warnings))
+        self.assertFalse(any("所在地区" in warning for warning in warnings))
+
     def test_supplement_exception_is_reported_as_failure(self):
         with patch.object(SUPPLEMENT.pipe, "read_json", return_value={"creators": [{"key": "a"}]}), patch.object(
             SUPPLEMENT.pipe, "path_from", return_value=Path(__file__),

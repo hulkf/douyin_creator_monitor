@@ -49,6 +49,20 @@ class PipelineError(RuntimeError):
     pass
 
 
+class CommandError(PipelineError):
+    def __init__(self, label: str, returncode: int, stdout: str, stderr: str) -> None:
+        self.label = label
+        self.returncode = int(returncode)
+        self.stdout = str(stdout or "")
+        self.stderr = str(stderr or "")
+        detail = self.stderr or self.stdout
+        super().__init__(f"{label} 失败，退出码 {self.returncode}: {detail}")
+
+
+class CommandTimeoutError(PipelineError):
+    pass
+
+
 class ProfileBlockedError(PipelineError):
     """Raised when a profile becomes blocked while waiting for its lock."""
 
@@ -75,9 +89,12 @@ class Logger:
 
 
 class Runner:
-    def __init__(self, logger: Logger, dry_run: bool) -> None:
+    def __init__(
+        self, logger: Logger, dry_run: bool, *, default_timeout_seconds: float = 3600,
+    ) -> None:
         self.logger = logger
         self.dry_run = dry_run
+        self.default_timeout_seconds = max(1.0, float(default_timeout_seconds))
         self.metrics: list[dict[str, Any]] = []
         self._metrics_lock = threading.Lock()
 
@@ -102,6 +119,7 @@ class Runner:
         env: dict[str, str],
         *,
         sensitive: Iterable[str] = (),
+        timeout_seconds: float | None = None,
     ) -> str:
         shown = self.display(command, sensitive)
         if self.dry_run:
@@ -111,36 +129,75 @@ class Runner:
             return ""
         self.logger.write(f"开始 {label}: {shown}")
         started = time.perf_counter()
+        process: subprocess.Popen[str] | None = None
+        timeout = self.default_timeout_seconds if timeout_seconds is None else max(1.0, float(timeout_seconds))
         try:
-            result = subprocess.run(
+            popen_options: dict[str, Any] = {}
+            if os.name == "nt":
+                popen_options["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            process = subprocess.Popen(
                 command,
                 cwd=PROJECT_DIR,
                 env=env,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                check=False,
+                **popen_options,
             )
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            if process is not None:
+                terminate_process_tree(process)
+                stdout, stderr = process.communicate()
+            else:
+                stdout, stderr = "", ""
+            elapsed = round(time.perf_counter() - started, 3)
+            with self._metrics_lock:
+                self.metrics.append({
+                    "label": label,
+                    "seconds": elapsed,
+                    "status": "timeout",
+                    "timeout_seconds": timeout,
+                })
+            raise CommandTimeoutError(f"{label} 超过 {timeout:g} 秒，已终止子进程树") from exc
         except Exception:
             elapsed = round(time.perf_counter() - started, 3)
             with self._metrics_lock:
                 self.metrics.append({"label": label, "seconds": elapsed, "status": "failed"})
             raise
-        stdout = result.stdout.strip()
-        stderr = result.stderr.strip()
+        stdout = (stdout or "").strip()
+        stderr = (stderr or "").strip()
         if stdout:
             self.logger.write(f"{label} stdout: {truncate(stdout)}")
         if stderr:
             self.logger.write(f"{label} stderr: {truncate(stderr)}")
         elapsed = round(time.perf_counter() - started, 3)
-        status = "failed" if result.returncode else "success"
+        returncode = int(process.returncode if process is not None else -1)
+        status = "failed" if returncode else "success"
         with self._metrics_lock:
             self.metrics.append({"label": label, "seconds": elapsed, "status": status})
-        if result.returncode:
-            raise PipelineError(f"{label} 失败，退出码 {result.returncode}: {stderr or stdout}")
+        if returncode:
+            raise CommandError(label, returncode, stdout, stderr)
         self.logger.write(f"完成 {label}")
         return stdout
+
+
+def terminate_process_tree(process: subprocess.Popen[str]) -> None:
+    """Best-effort termination of the child and all descendants."""
+
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if process.poll() is None:
+            process.kill()
+    else:
+        process.kill()
 
 def truncate(text: str, limit: int = 4000) -> str:
     if len(text) <= limit:
@@ -413,6 +470,32 @@ def pending_collection_ids(state_file: Path, works_file: Path) -> list[str]:
     if not isinstance(values, list):
         return []
     return list(dict.fromkeys(str(value) for value in values if str(value)))
+
+
+def delivery_retry_ids(state_file: Path) -> list[str]:
+    if not state_file.exists():
+        return []
+    try:
+        payload = read_json(state_file)
+    except PipelineError:
+        return []
+    values = payload.get("delivery_retry_aweme_ids", [])
+    if not isinstance(values, list):
+        return []
+    return list(dict.fromkeys(str(value) for value in values if str(value)))
+
+
+def update_delivery_retries(
+    state_file: Path, *, retry_ids: Iterable[str], completed_ids: Iterable[str],
+) -> None:
+    payload = read_json(state_file) if state_file.exists() else {}
+    retries = set(delivery_retry_ids(state_file))
+    retries.difference_update(str(value) for value in completed_ids)
+    retries.update(str(value) for value in retry_ids)
+    payload["delivery_retry_aweme_ids"] = sorted(retries)
+    payload["delivery_retry_count"] = len(retries)
+    payload["last_delivery_retry_update_at"] = now_text()
+    write_json(state_file, payload)
 
 
 def complete_collection_pending(state_file: Path, works_file: Path, completed_ids: Iterable[str]) -> None:
@@ -1365,6 +1448,42 @@ def ima_command(config: dict[str, Any], creator: dict[str, Any], paths: dict[str
     return command
 
 
+def ima_auth_check_command(config: dict[str, Any]) -> list[str]:
+    ima = section(config, "ima")
+    command = py(config, "backup_transcripts_to_ima.py")
+    append_option(command, "--mapping", path_from(ima.get("mapping"), PROJECT_DIR / "local" / "ima_creator_mapping.json"))
+    command.append("auth-check")
+    return command
+
+
+def ensure_ima_auth_preflight(
+    config: dict[str, Any], runner: Runner, logger: Logger,
+    env: dict[str, str], args: argparse.Namespace,
+) -> None:
+    if (
+        args.dry_run
+        or getattr(args, "skip_ima", False)
+        or getattr(args, "feishu_only", False)
+        or not bool(section(config, "ima").get("enabled", True))
+        or getattr(args, "_ima_auth_checked", False)
+    ):
+        return
+    args._ima_auth_checked = True
+    breakers = getattr(args, "_global_delivery_breakers", {})
+    if not isinstance(breakers, dict):
+        breakers = {}
+    try:
+        runner.run("验证 IMA 凭证", ima_auth_check_command(config), env)
+    except Exception as exc:
+        detail = str(exc)
+        if permanent_delivery_error(detail):
+            breakers["ima_backed_up"] = detail
+            logger.write(f"IMA 凭证失效，本轮 IMA 备份已熔断: {detail}")
+        else:
+            logger.write(f"IMA 凭证预检暂时失败，保留逐作品重试: {detail}")
+    args._global_delivery_breakers = breakers
+
+
 def ima_ensure_command(config: dict[str, Any], creator: dict[str, Any], metadata: Path) -> list[str]:
     ima = section(config, "ima")
     name = str(creator.get("ima_creator_name") or creator.get("creator_name") or creator.get("creator_dir_name") or "").strip()
@@ -1464,13 +1583,15 @@ def obsidian_ensure_command(
 def creator_match(creator: dict[str, Any]) -> tuple[str, str]:
     explicit_field = str(creator.get("feishu_match_field") or "").strip()
     explicit_value = str(creator.get("feishu_match_value") or "").strip()
-    if explicit_field and explicit_value:
+    if explicit_field and explicit_value and explicit_field != "达人昵称":
         return explicit_field, explicit_value
     creator_url = str(creator.get("creator_url") or "").strip().rstrip("/")
     if creator_url:
         sec_uid = creator_url.rsplit("/", 1)[-1].split("?", 1)[0].strip()
         if sec_uid:
             return "SecUID", sec_uid
+    if explicit_field and explicit_value:
+        return explicit_field, explicit_value
     name = str(creator.get("creator_name") or "").strip()
     if name:
         return "达人昵称", name
@@ -1898,6 +2019,7 @@ def permanent_delivery_error(error: str) -> bool:
     permanent = (
         "credential", "cookie", "token invalid", "unauthorized", "forbidden", "permission denied",
         "access denied", "not configured", "missing config", "knowledge base", "folder mapping",
+        "http 401", "code 200002", "skill auth failed", "auth failed",
         "code 200005", "请求超量", "quota exceeded",
         "凭证", "登录态", "未配置", "配置缺失", "权限", "知识库不存在", "目录映射错误",
     )
@@ -2278,6 +2400,37 @@ def asr_worker_count(config: dict[str, Any], args: argparse.Namespace, work_coun
     return min(workers, max(1, work_count))
 
 
+def profile_partial_collection_result(exc: Exception, works_file: Path) -> dict[str, Any] | None:
+    """Recognize collector exit 2 as a usable works result plus a profile warning."""
+
+    if not isinstance(exc, CommandError) or exc.returncode != 2 or not works_file.exists():
+        return None
+    try:
+        payload: Any = None
+        decoder = json.JSONDecoder()
+        for match in reversed(list(re.finditer(r"(?m)^\s*\{", exc.stdout))):
+            candidate = exc.stdout[match.start():].lstrip()
+            try:
+                decoded, end = decoder.raw_decode(candidate)
+            except json.JSONDecodeError:
+                continue
+            if not candidate[end:].strip():
+                payload = decoded
+                break
+        profile_update = payload.get("profile_update") if isinstance(payload, dict) else None
+        works = load_works(works_file)
+    except (OSError, PipelineError):
+        return None
+    if (
+        not works
+        or not isinstance(profile_update, dict)
+        or not profile_update.get("partial")
+        or profile_update.get("reason") != "creator_profile_core_fields_missing"
+    ):
+        return None
+    return profile_update
+
+
 def collect_creator_phase(
     config: dict[str, Any], creator: dict[str, Any], runner: Runner,
     logger: Logger, env: dict[str, str], args: argparse.Namespace,
@@ -2302,6 +2455,7 @@ def collect_creator_phase(
     }
 
     collection_ok = True
+    profile_ok = True
     sync_ok = True
     collection_attempted = not args.skip_collect
     if args.skip_collect:
@@ -2377,6 +2531,27 @@ def collect_creator_phase(
                     })
                     continue
                 except Exception as exc:
+                    partial_profile = profile_partial_collection_result(exc, works_file)
+                    if partial_profile is not None:
+                        collection_ok = True
+                        profile_ok = False
+                        exhausted_by_block = False
+                        result["profile_collection"] = "partial"
+                        result["profile_collection_error"] = str(partial_profile.get("reason") or "")
+                        result["profile_missing_core_fields"] = list(
+                            partial_profile.get("missing_core_fields") or []
+                        )
+                        result["account_profile_key"] = profile_key
+                        result["account_profile_group"] = group_key
+                        pool_attempts.append({
+                            "profile_key": profile_key,
+                            "status": "profile_partial",
+                        })
+                        logger.write(
+                            f"达人资料不完整 {name}: {result['profile_missing_core_fields']}；"
+                            "作品采集结果继续进入下游，不重复抓取"
+                        )
+                        break
                     last_error = exc
                     if account_blocked_error(exc):
                         blocked_profiles.add(profile_key)
@@ -2431,13 +2606,44 @@ def collect_creator_phase(
                     env,
                 )
             except Exception as exc:
-                collection_ok = False
-                result["collection_error"] = str(exc)
-                logger.write(f"采集失败 {name}: {exc}")
+                partial_profile = profile_partial_collection_result(exc, works_file)
+                if partial_profile is not None:
+                    profile_ok = False
+                    result["profile_collection"] = "partial"
+                    result["profile_collection_error"] = str(partial_profile.get("reason") or "")
+                    result["profile_missing_core_fields"] = list(
+                        partial_profile.get("missing_core_fields") or []
+                    )
+                    logger.write(
+                        f"达人资料不完整 {name}: {result['profile_missing_core_fields']}；"
+                        "作品采集结果继续进入下游，不重复抓取"
+                    )
+                else:
+                    collection_ok = False
+                    result["collection_error"] = str(exc)
+                    logger.write(f"采集失败 {name}: {exc}")
                 if args.fail_fast:
                     raise
 
-    if collection_ok and not args.skip_collect and not args.normalize_only:
+    if not collection_ok:
+        result["collection_ok"] = False
+        result["profile_ok"] = profile_ok
+        result["feishu_sync_ok"] = sync_ok
+        result["status"] = "failed"
+        result["phase_timings"]["collection_and_sync_seconds"] = round(
+            time.perf_counter() - phase_started, 3,
+        )
+        return {
+            "creator": creator,
+            "result": result,
+            "terminal": True,
+            "name": name,
+            "collection_ok": False,
+            "profile_ok": profile_ok,
+            "sync_ok": sync_ok,
+        }
+
+    if collection_ok and profile_ok and not args.skip_collect and not args.normalize_only:
         if args.skip_feishu_sync:
             logger.write(f"跳过飞书达人资料同步 {name}")
         else:
@@ -2484,16 +2690,22 @@ def collect_creator_phase(
     elif collection_attempted:
         pending_selection = True
         pending_ids = pending_collection_ids(collection_state_file, works_file)
-        selected = select_works(all_works, set(pending_ids), maximum) if pending_ids else []
+        retry_ids = delivery_retry_ids(collection_state_file)
+        selected_ids = set(pending_ids) | set(retry_ids)
+        selected = select_works(all_works, selected_ids, maximum) if selected_ids else []
         result["pending_count"] = len(pending_ids)
+        result["delivery_retry_count"] = len(retry_ids)
     else:
         selected = select_works(all_works, set(), maximum)
     result["selected_count"] = len(selected)
     logger.write(f"{name} 本轮选择 {len(selected)} / {len(all_works)} 条作品")
+    result["collection_ok"] = collection_ok
+    result["profile_ok"] = profile_ok
+    result["feishu_sync_ok"] = sync_ok
 
     if not selected:
         result["backup_mappings"] = {}
-        result["status"] = "success" if collection_ok and sync_ok else "partial_failure"
+        result["status"] = "success" if collection_ok and profile_ok and sync_ok else "partial_failure"
         reason = "没有待处理的新作品" if pending_selection else "没有待补录的历史作品"
         logger.write(f"{name} {reason}，跳过飞书、ASR 和备份阶段")
         result["phase_timings"]["collection_and_sync_seconds"] = round(
@@ -2501,7 +2713,7 @@ def collect_creator_phase(
         )
         return {
             "creator": creator, "result": result, "terminal": True, "name": name,
-            "collection_ok": collection_ok, "sync_ok": sync_ok,
+            "collection_ok": collection_ok, "profile_ok": profile_ok, "sync_ok": sync_ok,
         }
 
     if not args.dry_run:
@@ -2564,6 +2776,7 @@ def collect_creator_phase(
         "result": result,
         "selected": selected,
         "collection_ok": collection_ok,
+        "profile_ok": profile_ok,
         "sync_ok": sync_ok,
         "synced_record_ids": synced_record_ids,
         "terminal": False,
@@ -2603,6 +2816,94 @@ def work_has_failed_stage(stages: dict[str, Any], *, feishu_only: bool = False) 
             for stage in ("feishu_written_back", "backup_statuses_written_back")
         )
     return "failed" in stages.values()
+
+
+def summarize_run_health(creators: list[dict[str, Any]]) -> dict[str, Any]:
+    """Separate core ingestion health from optional delivery degradation."""
+
+    core_failed_creators: list[str] = []
+    delivery_degraded_creators: list[str] = []
+    profile_degraded_creators: list[str] = []
+    core_stages = {
+        "transcribed", "corrected", "feishu_written_back",
+        "backup_statuses_written_back", "downstream",
+    }
+    delivery_stages = {"summarized", "ima_backed_up", "kuake_backed_up", "obsidian_exported"}
+    for creator in creators:
+        key = str(creator.get("key") or "unknown")
+        works = creator.get("works") if isinstance(creator.get("works"), list) else []
+        core_failed = (
+            creator.get("status") == "failed"
+            or creator.get("collection_ok") is False
+            or (
+                creator.get("status") == "partial_failure"
+                and bool(creator.get("collection_error"))
+            )
+            or creator.get("feishu_sync_ok") is False
+            or any(
+                any(stages.get(stage) in {"failed", "blocked", "pending"} for stage in core_stages)
+                for stages in (
+                    item.get("stages", {}) for item in works if isinstance(item, dict)
+                )
+            )
+        )
+        if core_failed:
+            core_failed_creators.append(key)
+        if creator.get("profile_ok") is False:
+            profile_degraded_creators.append(key)
+        mapping_failed = "failed" in (
+            creator.get("backup_mappings", {}).values()
+            if isinstance(creator.get("backup_mappings"), dict) else []
+        )
+        delivery_failed = mapping_failed or any(
+            any(stages.get(stage) in {"failed", "blocked", "pending"} for stage in delivery_stages)
+            for stages in (
+                item.get("stages", {}) for item in works if isinstance(item, dict)
+            )
+        )
+        if delivery_failed:
+            delivery_degraded_creators.append(key)
+    return {
+        "core_status": "failed" if core_failed_creators else "success",
+        "delivery_status": "degraded" if delivery_degraded_creators else "success",
+        "profile_status": "degraded" if profile_degraded_creators else "success",
+        "issue_counts": {
+            "core_failed_creators": len(core_failed_creators),
+            "delivery_degraded_creators": len(delivery_degraded_creators),
+            "profile_degraded_creators": len(profile_degraded_creators),
+        },
+        "issue_creators": {
+            "core": core_failed_creators,
+            "delivery": delivery_degraded_creators,
+            "profile": profile_degraded_creators,
+        },
+    }
+
+
+def classify_work_completion(
+    works: list[dict[str, Any]], *, collection_ok: bool, sync_ok: bool,
+) -> tuple[list[str], list[str], list[str]]:
+    """Return core-complete, delivery-retry, and fully-complete work IDs."""
+
+    core_complete_ids: list[str] = []
+    delivery_retry_work_ids: list[str] = []
+    delivery_complete_ids: list[str] = []
+    optional_stages = ("summarized", "ima_backed_up", "kuake_backed_up", "obsidian_exported")
+    core_stages = ("transcribed", "corrected", "feishu_written_back", "backup_statuses_written_back", "downstream")
+    for item in works:
+        work_id = str(item["aweme_id"])
+        stages = item.get("stages", {})
+        core_complete = collection_ok and sync_ok and not any(
+            stages.get(stage) in {"failed", "blocked", "pending"} for stage in core_stages
+        )
+        if not core_complete:
+            continue
+        core_complete_ids.append(work_id)
+        if any(stages.get(stage) in {"failed", "blocked", "pending"} for stage in optional_stages):
+            delivery_retry_work_ids.append(work_id)
+        else:
+            delivery_complete_ids.append(work_id)
+    return core_complete_ids, delivery_retry_work_ids, delivery_complete_ids
 
 
 def finalize_creator_batches(
@@ -2772,13 +3073,15 @@ def process_creator_phase(
     collection_state_file = context["collection_state_file"]
     selected = context["selected"]
     collection_ok = bool(context["collection_ok"])
+    profile_ok = bool(context.get("profile_ok", True))
     sync_ok = bool(context["sync_ok"])
     synced_record_ids = context["synced_record_ids"]
     work_by_id = {str(work["aweme_id"]): work for work in selected}
     delivery_results: dict[str, dict[str, Any]] = {}
     args._defer_kuake = True
     args._defer_feishu_writeback = True
-    args._delivery_breakers = {}
+    ensure_ima_auth_preflight(config, runner, logger, env, args)
+    args._delivery_breakers = dict(getattr(args, "_global_delivery_breakers", {}))
 
     def failed_preparation(work_id: str, exc: Exception) -> dict[str, Any]:
         logger.write(f"作品预处理异常 {work_id}: {exc}")
@@ -2900,10 +3203,23 @@ def process_creator_phase(
         for item in result["works"]
     )
     mapping_failed = "failed" in result.get("backup_mappings", {}).values()
-    result["status"] = "partial_failure" if (not collection_ok or not sync_ok or mapping_failed or failed_work) else "success"
-    if result["status"] == "success" and not args.dry_run:
+    result["collection_ok"] = collection_ok
+    result["profile_ok"] = profile_ok
+    result["feishu_sync_ok"] = sync_ok
+    result["status"] = "partial_failure" if (
+        not collection_ok or not profile_ok or not sync_ok or mapping_failed or failed_work
+    ) else "success"
+    if not args.dry_run:
+        core_complete_ids, delivery_retry_work_ids, delivery_complete_ids = classify_work_completion(
+            result["works"], collection_ok=collection_ok, sync_ok=sync_ok,
+        )
         complete_collection_pending(
-            collection_state_file, works_file, [str(work["aweme_id"]) for work in selected],
+            collection_state_file, works_file, core_complete_ids,
+        )
+        update_delivery_retries(
+            collection_state_file,
+            retry_ids=delivery_retry_work_ids,
+            completed_ids=delivery_complete_ids,
         )
     result.setdefault("phase_timings", {})["transcript_processing_seconds"] = round(
         time.perf_counter() - phase_started, 3,
@@ -2988,7 +3304,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-obsidian", action="store_true")
     parser.add_argument(
         "--feishu-only", action="store_true",
-        help="??????????????????????????????????????",
+        help="只补齐飞书基础数据、最终文案和备份状态，不重新采集、转写或上传备份",
     )
     parser.add_argument(
         "--refresh-mappings", action="store_true",
@@ -3082,7 +3398,16 @@ def main(argv: list[str] | None = None) -> int:
 
         log_dir = path_from(config.get("log_dir"), DEFAULT_LOG_DIR) or DEFAULT_LOG_DIR
         logger = Logger(log_dir / f"pipeline-{run_id}.log", persist=not args.dry_run)
-        runner = Runner(logger, args.dry_run)
+        timeout_value = section(config, "timeouts").get("default_seconds", 3600)
+        try:
+            default_timeout_seconds = float(timeout_value)
+        except (TypeError, ValueError) as exc:
+            raise PipelineError(f"timeouts.default_seconds 必须是正数: {timeout_value}") from exc
+        if default_timeout_seconds <= 0:
+            raise PipelineError("timeouts.default_seconds 必须大于 0。")
+        runner = Runner(
+            logger, args.dry_run, default_timeout_seconds=default_timeout_seconds,
+        )
         env = child_env(config)
         logger.write(f"流水线开始，配置={config_path}，dry_run={args.dry_run}")
         summary: dict[str, Any] = {
@@ -3265,6 +3590,7 @@ def main(argv: list[str] | None = None) -> int:
         summary["finished_at"] = now_text()
         summary["wall_seconds"] = round(time.perf_counter() - wall_started, 3)
         summary["timings"] = summarize_metrics(runner.metrics)
+        summary.update(summarize_run_health(summary["creators"]))
         failed = bool(supplement_error) or any(
             item.get("status") in {"failed", "partial_failure"} for item in summary["creators"]
         )

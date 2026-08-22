@@ -4,6 +4,9 @@
   "state_dir": "runtime/pipeline",
   "media_dir": "runtime/media",
   "log_dir": "logs",
+  "timeouts": {
+    "default_seconds": 3600
+  },
   "collection": {
     "incremental_enabled": true,
     "incremental_probe_count": 3,

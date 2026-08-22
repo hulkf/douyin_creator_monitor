@@ -36,6 +36,14 @@ $env:IMA_OPENAPI_APIKEY = "你的 API Key"
 douyin_creator_monitor/local/ima.env.json
 ```
 
+配置后可先执行官方只读鉴权检查；该命令不创建目录、不上传文件：
+
+```powershell
+python .\scripts\backup_transcripts_to_ima.py auth-check
+```
+
+每日流水线也会在本轮第一次 IMA 交付前执行一次相同检查。凭证失效时仅熔断本轮 IMA 目标，飞书、夸克和 Obsidian 仍继续。
+
 ## 博主映射
 
 先复制模板：

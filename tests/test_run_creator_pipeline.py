@@ -77,6 +77,11 @@ class PipelineHelpersTest(unittest.TestCase):
     def test_ima_daily_quota_error_is_permanent_for_current_creator(self):
         self.assertTrue(PIPELINE.permanent_delivery_error("HTTP 403 / code 200005 / 请求超量，请明日再试"))
 
+    def test_ima_invalid_skill_auth_is_permanent_for_current_creator(self):
+        self.assertTrue(PIPELINE.permanent_delivery_error(
+            'HTTP 401: {"code":200002,"msg":"skill auth failed"}'
+        ))
+
     def test_permanent_delivery_error_opens_creator_target_circuit_breaker(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -878,8 +883,9 @@ class PipelineHelpersTest(unittest.TestCase):
     def test_runner_records_precise_success_timing(self):
         logger = PIPELINE.Logger(Path("unused.log"), persist=False)
         runner = PIPELINE.Runner(logger, dry_run=False)
-        completed = Mock(returncode=0, stdout="ok", stderr="")
-        with patch.object(PIPELINE.subprocess, "run", return_value=completed), patch.object(
+        completed = Mock(returncode=0)
+        completed.communicate.return_value = ("ok", "")
+        with patch.object(PIPELINE.subprocess, "Popen", return_value=completed), patch.object(
             PIPELINE.time, "perf_counter", side_effect=[10.0, 12.25]
         ):
             runner.run("测试阶段", ["tool"], {})
@@ -887,15 +893,104 @@ class PipelineHelpersTest(unittest.TestCase):
         self.assertEqual(runner.metrics[0]["status"], "success")
         self.assertEqual(runner.metrics[0]["seconds"], 2.25)
 
+    def test_runner_applies_a_default_timeout_to_every_child_process(self):
+        logger = PIPELINE.Logger(Path("unused.log"), persist=False)
+        runner = PIPELINE.Runner(logger, dry_run=False, default_timeout_seconds=45)
+        process = Mock(returncode=0)
+        process.communicate.return_value = ("ok", "")
+        with patch.object(PIPELINE.subprocess, "Popen", return_value=process) as popen:
+            runner.run("测试阶段", ["tool"], {})
+        process.communicate.assert_called_once_with(timeout=45)
+        self.assertEqual(popen.call_count, 1)
+
+    def test_creator_match_prefers_stable_secuid_over_explicit_nickname(self):
+        creator = {
+            "creator_url": "https://www.douyin.com/user/MS4wLjABAAAAstable?from_tab_name=main",
+            "creator_name": "新昵称",
+            "feishu_match_field": "达人昵称",
+            "feishu_match_value": "旧昵称",
+        }
+        self.assertEqual(PIPELINE.creator_match(creator), ("SecUID", "MS4wLjABAAAAstable"))
+
     def test_runner_records_timing_when_subprocess_raises(self):
         logger = PIPELINE.Logger(Path("unused.log"), persist=False)
         runner = PIPELINE.Runner(logger, dry_run=False)
-        with patch.object(PIPELINE.subprocess, "run", side_effect=OSError("cannot start")), patch.object(
+        with patch.object(PIPELINE.subprocess, "Popen", side_effect=OSError("cannot start")), patch.object(
             PIPELINE.time, "perf_counter", side_effect=[10.0, 10.5]
         ):
             with self.assertRaises(OSError):
                 runner.run("启动失败", ["tool"], {})
         self.assertEqual(runner.metrics[0], {"label": "启动失败", "seconds": 0.5, "status": "failed"})
+
+    def test_ima_auth_preflight_runs_once_and_opens_a_global_breaker(self):
+        args = argparse.Namespace(
+            dry_run=False, skip_ima=False, feishu_only=False,
+        )
+        runner = Mock()
+        runner.run.side_effect = PIPELINE.PipelineError(
+            "HTTP 401 code 200002: skill auth failed"
+        )
+        logger = PIPELINE.Logger(Path("unused.log"), persist=False)
+        config = {"ima": {"enabled": True}}
+
+        PIPELINE.ensure_ima_auth_preflight(config, runner, logger, {}, args)
+        PIPELINE.ensure_ima_auth_preflight(config, runner, logger, {}, args)
+
+        self.assertEqual(runner.run.call_count, 1)
+        self.assertIn("ima_backed_up", args._global_delivery_breakers)
+
+    def test_optional_delivery_failure_leaves_core_complete_and_queues_delivery_retry(self):
+        works = [{
+            "aweme_id": "1",
+            "stages": {
+                "transcribed": "success", "corrected": "success",
+                "feishu_written_back": "success", "backup_statuses_written_back": "success",
+                "ima_backed_up": "failed", "kuake_backed_up": "success",
+                "obsidian_exported": "success", "summarized": "success",
+            },
+        }]
+        core, retry, complete = PIPELINE.classify_work_completion(
+            works, collection_ok=True, sync_ok=True,
+        )
+        self.assertEqual(core, ["1"])
+        self.assertEqual(retry, ["1"])
+        self.assertEqual(complete, [])
+
+    def test_core_failure_remains_collection_pending(self):
+        works = [{
+            "aweme_id": "1",
+            "stages": {"transcribed": "failed", "ima_backed_up": "success"},
+        }]
+        core, retry, complete = PIPELINE.classify_work_completion(
+            works, collection_ok=True, sync_ok=True,
+        )
+        self.assertEqual((core, retry, complete), ([], [], []))
+
+    def test_run_health_separates_core_profile_and_delivery_status(self):
+        health = PIPELINE.summarize_run_health([{
+            "key": "demo", "status": "partial_failure",
+            "collection_ok": True, "profile_ok": False, "feishu_sync_ok": True,
+            "backup_mappings": {},
+            "works": [{"stages": {
+                "transcribed": "success", "corrected": "success",
+                "feishu_written_back": "success", "backup_statuses_written_back": "success",
+                "ima_backed_up": "failed",
+            }}],
+        }])
+        self.assertEqual(health["core_status"], "success")
+        self.assertEqual(health["profile_status"], "degraded")
+        self.assertEqual(health["delivery_status"], "degraded")
+
+    def test_run_health_counts_partial_collection_error_without_boolean_flags(self):
+        health = PIPELINE.summarize_run_health([{
+            "key": "demo",
+            "status": "partial_failure",
+            "collection_error": "collector exited 2",
+            "works": [],
+        }])
+
+        self.assertEqual(health["core_status"], "failed")
+        self.assertEqual(health["issue_creators"]["core"], ["demo"])
 
     def test_combined_finalizer_duration_is_not_double_counted(self):
         state = {}
@@ -1000,6 +1095,21 @@ class PipelineHelpersTest(unittest.TestCase):
                 self.assertEqual(updated["pending_aweme_ids"], ["new-2", "new-1"])
                 self.assertEqual(updated["pending_count"], 2)
                 self.assertIn("last_pipeline_completed_at", updated)
+
+    def test_delivery_retry_queue_is_independent_and_resumable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_file = Path(directory) / "collection.json"
+            state_file.write_text(json.dumps({
+                "pending_aweme_ids": ["core-failed"],
+                "delivery_retry_aweme_ids": ["retry-old"],
+            }), encoding="utf-8")
+
+            PIPELINE.update_delivery_retries(
+                state_file, retry_ids=["retry-new"], completed_ids=["retry-old"],
+            )
+
+            self.assertEqual(PIPELINE.pending_collection_ids(state_file, state_file), ["core-failed"])
+            self.assertEqual(PIPELINE.delivery_retry_ids(state_file), ["retry-new"])
 
     def test_max_works_limits_pending_selection_without_discarding_remainder(self):
         works = [
@@ -1748,12 +1858,22 @@ class PipelineHelpersTest(unittest.TestCase):
             self.assertEqual(labels, ["采集 示例", "飞书达人资料同步 示例"])
             self.assertEqual(context["result"]["profile_sync"], "success")
             self.assertTrue(context["terminal"])
+            self.assertTrue(context["result"]["collection_ok"])
+            self.assertTrue(context["result"]["profile_ok"])
+            self.assertTrue(context["result"]["feishu_sync_ok"])
 
     def test_failed_collection_never_syncs_stale_profile(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             works_file = root / "works.json"
-            works_file.write_text(json.dumps({"works": []}), encoding="utf-8")
+            works_file.write_text(json.dumps({
+                "works": [{
+                    "aweme_id": "stale", "create_time": 1,
+                    "digg_count": 1, "comment_count": 2,
+                    "collect_count": 3, "share_count": 4,
+                }],
+                "pending_aweme_ids": ["stale"],
+            }), encoding="utf-8")
             creator = {
                 "key": "demo", "creator_name": "示例",
                 "creator_url": "https://www.douyin.com/user/sec-demo",
@@ -1779,7 +1899,66 @@ class PipelineHelpersTest(unittest.TestCase):
             )
 
             self.assertEqual(runner.run.call_count, 1)
-            self.assertEqual(context["result"]["status"], "partial_failure")
+            self.assertTrue(context["terminal"])
+            self.assertFalse(context["collection_ok"])
+            self.assertEqual(context["result"]["status"], "failed")
+            self.assertEqual(context["result"]["works"], [])
+            self.assertNotIn("profile_sync", context["result"])
+
+    def test_profile_partial_exit_keeps_collected_works_without_profile_sync(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            works_file = root / "works.json"
+            works_file.write_text(json.dumps({
+                "works": [{
+                    "aweme_id": "1", "create_time": 1,
+                    "digg_count": 1, "comment_count": 2,
+                    "collect_count": 3, "share_count": 4,
+                }],
+                "pending_aweme_ids": [],
+            }), encoding="utf-8")
+            creator = {
+                "key": "demo", "creator_name": "示例",
+                "creator_url": "https://www.douyin.com/user/sec-demo",
+                "works_file": str(works_file),
+                "profile_file": str(root / "profile.json"),
+                "media_output_dir": str(root / "media-output"),
+            }
+            config = {
+                "python": "python", "state_dir": str(root / "state"),
+                "media_dir": str(root / "media"),
+                "feishu": {"creator_table_id": "tbl"},
+            }
+            args = argparse.Namespace(
+                config=root / "pipeline.json", skip_collect=False, normalize_only=False,
+                force_full_collect=False, skip_feishu_sync=False, fail_fast=False,
+                dry_run=False, max_works=None, aweme_id=[], backfill_existing=False,
+            )
+            runner = Mock()
+            runner.run.side_effect = PIPELINE.CommandError(
+                "采集 示例", 2,
+                "[collector] isolated browser profile=demo\n"
+                "[collector] chrome launch flags headless=true\n"
+                + json.dumps({
+                    "count": 1,
+                    "profile_update": {
+                        "partial": True,
+                        "reason": "creator_profile_core_fields_missing",
+                        "missing_core_fields": ["IP属地"],
+                    },
+                }, ensure_ascii=False, indent=2),
+                "",
+            )
+
+            context = PIPELINE.collect_creator_phase(
+                config, creator, runner, PIPELINE.Logger(root / "log.txt", persist=False), {}, args,
+            )
+
+            self.assertEqual(runner.run.call_count, 1)
+            self.assertTrue(context["collection_ok"])
+            self.assertFalse(context["profile_ok"])
+            self.assertEqual(context["result"]["profile_collection"], "partial")
+            self.assertNotIn("collection_error", context["result"])
             self.assertNotIn("profile_sync", context["result"])
 
 
