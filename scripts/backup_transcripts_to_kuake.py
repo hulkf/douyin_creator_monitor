@@ -20,6 +20,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+try:
+    from input_paths import iter_input_files
+except ImportError:  # direct loading by repository tests
+    from scripts.input_paths import iter_input_files
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_LOCAL_ENV_PATH = PROJECT_ROOT / "local" / "kuake.env.json"
@@ -386,10 +391,12 @@ def cmd_upload_dir(args: argparse.Namespace) -> int:
         remote_dir = args.remote_dir or join_remote_path(base_dir, sanitize_path_part(args.creator_name))
     else:
         remote_dir = args.remote_dir or base_dir
-    files = sorted(args.input_dir.glob(args.pattern))
-    txt_files = [path for path in files if path.is_file() and path.suffix.lower() == ".txt"]
+    try:
+        txt_files = iter_input_files(args.input_dir, pattern=args.pattern, suffixes=(".txt",))
+    except (NotADirectoryError, OSError) as exc:
+        raise KuakeBackupError(str(exc)) from exc
     if not txt_files:
-        raise KuakeBackupError(f"目录中没有匹配的 TXT 文件: {args.input_dir} / {args.pattern}")
+        raise KuakeBackupError(f"输入路径中没有匹配的 TXT 文件: {args.input_dir} / {args.pattern}")
     directory = ensure_dir_details(args.kuake_exe, credentials, remote_dir) if args.create_dir else RemoteDirectory(
         name=remote_dir.rstrip("/").rsplit("/", 1)[-1], path=remote_dir
     )
@@ -448,8 +455,8 @@ def build_parser() -> argparse.ArgumentParser:
     manifest_parser.add_argument("--remote-dir", default="")
     manifest_parser.set_defaults(func=cmd_upload_manifest)
 
-    upload_dir_parser = subparsers.add_parser("upload-dir", help="上传目录中的 TXT 文案")
-    upload_dir_parser.add_argument("--input-dir", type=Path, required=True)
+    upload_dir_parser = subparsers.add_parser("upload-dir", help="上传一个 TXT 文件或目录当前层的 TXT 文案")
+    upload_dir_parser.add_argument("--input-dir", type=Path, required=True, help="一个 TXT 文件或目录；目录只扫描当前层")
     upload_dir_parser.add_argument("--pattern", default="*.txt")
     upload_dir_parser.add_argument("--base-dir", default="", help="夸克备份根目录，默认读取 local 配置")
     upload_dir_parser.add_argument("--creator-name", default="", help="博主名称；提供后默认上传到 根目录/博主名称")

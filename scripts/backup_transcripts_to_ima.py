@@ -11,7 +11,6 @@ the standard IMA config files:
 from __future__ import annotations
 
 import argparse
-import fnmatch
 import hashlib
 import hmac
 import json
@@ -25,6 +24,11 @@ from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+
+try:
+    from input_paths import iter_input_files
+except ImportError:  # direct loading by repository tests
+    from scripts.input_paths import iter_input_files
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -134,6 +138,16 @@ def ima_api(credentials: ImaCredentials, path: str, body: dict[str, Any]) -> dic
         raise ImaBackupError(str(error_message or result))
     data = result.get("data")
     return data if isinstance(data, dict) else {}
+
+
+def probe_credentials(credentials: ImaCredentials) -> None:
+    """Validate credentials with a read-only request to the official IMA API."""
+
+    ima_api(
+        credentials,
+        "openapi/wiki/v1/search_knowledge_base",
+        {"query": "", "cursor": "", "limit": 20},
+    )
 
 
 def get_target(mapping_path: Path, creator_name: str) -> CreatorTarget:
@@ -517,9 +531,10 @@ def upload_file(credentials: ImaCredentials, target: CreatorTarget, file_path: P
 
 
 def iter_files(input_dir: Path, pattern: str) -> list[Path]:
-    if not input_dir.exists() or not input_dir.is_dir():
-        raise ImaBackupError(f"目录不存在: {input_dir}")
-    return sorted(path for path in input_dir.rglob("*") if path.is_file() and fnmatch.fnmatch(path.name, pattern))
+    try:
+        return iter_input_files(input_dir, pattern=pattern)
+    except (NotADirectoryError, OSError) as exc:
+        raise ImaBackupError(str(exc)) from exc
 
 
 def list_knowledge_bases(credentials: ImaCredentials) -> None:
@@ -563,6 +578,9 @@ def build_parser() -> argparse.ArgumentParser:
     list_parser = subparsers.add_parser("list-kbs", help="List visible IMA knowledge bases.")
     list_parser.set_defaults(func=handle_list_kbs)
 
+    auth_parser = subparsers.add_parser("auth-check", help="Validate IMA credentials without writing data.")
+    auth_parser.set_defaults(func=handle_auth_check)
+
     folder_parser = subparsers.add_parser("search-folder", help="Search folder names in an IMA knowledge base.")
     folder_parser.add_argument("--knowledge-base-id", required=True)
     folder_parser.add_argument("--query", required=True)
@@ -575,9 +593,9 @@ def build_parser() -> argparse.ArgumentParser:
     upload_parser.add_argument("--metadata-output", help="Write ensured IMA folder metadata as JSON.")
     upload_parser.set_defaults(func=handle_upload)
 
-    upload_dir_parser = subparsers.add_parser("upload-dir", help="Upload TXT transcripts under a directory.")
+    upload_dir_parser = subparsers.add_parser("upload-dir", help="Upload one TXT file or TXT files directly under a directory.")
     upload_dir_parser.add_argument("--creator-name", required=True)
-    upload_dir_parser.add_argument("--input-dir", required=True)
+    upload_dir_parser.add_argument("--input-dir", required=True, help="One TXT file or a directory; directories are scanned one level only.")
     upload_dir_parser.add_argument("--pattern", default="*.txt")
     upload_dir_parser.add_argument("--on-duplicate", choices=["timestamp", "skip", "fail"], default="timestamp")
     upload_dir_parser.add_argument("--metadata-output", help="Write ensured IMA folder metadata as JSON.")
@@ -592,6 +610,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def handle_list_kbs(args: argparse.Namespace) -> None:
     list_knowledge_bases(load_credentials())
+
+
+def handle_auth_check(args: argparse.Namespace) -> None:
+    probe_credentials(load_credentials())
+    print("IMA 凭证验证成功。")
 
 
 def handle_search_folder(args: argparse.Namespace) -> None:

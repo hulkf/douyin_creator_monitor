@@ -25,6 +25,7 @@
 - `feishu_transcript_writer.py`: 按 `抖音作品ID` 定位飞书作品表记录，并把词库纠正后的最终文案写回 `语音转写全文` 字段。
 - `sync_douyin_works_to_feishu.py`: 读取 MediaCrawler 适配层规范化后的作品 JSON，按 `抖音作品ID` 覆盖更新飞书作品表；只新增和更新，不删除飞书中已存在但本轮未抓到的历史记录。仍可通过 `--works-file` 指定历史 Crawlio 产物做兼容导入。
 - `backup_transcripts_to_kuake.py`: 读取本地夸克登录态配置，把火山 ASR 得到的 `.txt` 文案上传到夸克网盘指定目录。
+- 所有输入文件/目录参数都支持单个文件或目录；目录只扫描当前层，不递归处理下级目录。路径不经过 Shell 拼接，因此文件名或目录名包含单引号、双引号时无需额外转义。
 - `generate_transcript_summary.py`: 读取最终文案和内容总结提示词，按模板生成已填写的 Markdown 归档卡片，供 Obsidian 导出写入原文上方。
 - `check_and_onboard_new_creators.py`: 自动接入新增达人；主页资料默认 3 并发采集、支持 TTL 复用，并在采集失败时阻止旧资料回写。
 - `supplement_content_summary.py`: 批量补齐历史 Obsidian 笔记的内容总结；达人目录只扫描一次，任一生成、合并或飞书状态写回失败都会返回非零退出码。
